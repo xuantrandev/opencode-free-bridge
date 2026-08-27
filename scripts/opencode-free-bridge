@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# opencode-free-bridge launcher
+# - starts `opencode serve` on :4577 (loopback only)
+# - starts the OpenAI-compatible bridge on :5577 (loopback only)
+# Usage:  opencode-free-bridge [start|stop|status|logs]
+
+set -u
+
+BRIDGE_DIR="/root/opencode-free-bridge"
+BRIDGE_PORT="${BRIDGE_PORT:-5577}"
+OC_PORT="${OC_PORT:-4577}"
+BRIDGE_LOG="/var/log/opencode-free-bridge.log"
+OC_LOG="/var/log/opencode-serve.log"
+
+mkdir -p "$(dirname "$BRIDGE_LOG")" "$(dirname "$OC_LOG")"
+
+start() {
+  # 1) opencode serve (headless)
+  if ss -ltn 2>/dev/null | grep -q ":${OC_PORT} "; then
+    echo "[oc-serve] already up on :${OC_PORT}"
+  else
+    echo "[oc-serve] starting on :${OC_PORT}"
+    ( nohup opencode serve --port "${OC_PORT}" --hostname 127.0.0.1 \
+      >> "$OC_LOG" 2>&1 & echo $! > /run/opencode-serve.pid ) &
+    wait
+    sleep 2
+  fi
+
+  # 2) bridge
+  if ss -ltn 2>/dev/null | grep -q ":${BRIDGE_PORT} "; then
+    echo "[bridge] already up on :${BRIDGE_PORT}"
+  else
+    echo "[bridge] starting on :${BRIDGE_PORT}"
+    ( cd "$BRIDGE_DIR" && nohup node server.mjs \
+      >> "$BRIDGE_LOG" 2>&1 & echo $! > /run/opencode-free-bridge.pid ) &
+    wait
+    sleep 1
+  fi
+
+  # 3) health check
+  for i in 1 2 3 4 5; do
+    if curl -sf "http://127.0.0.1:${BRIDGE_PORT}/healthz" >/dev/null; then
+      echo "[ok] bridge is responding on http://127.0.0.1:${BRIDGE_PORT}/v1"
+      models=$(curl -s "http://127.0.0.1:${BRIDGE_PORT}/v1/models" | python3 -c "import json,sys; print(', '.join(m['id'] for m in json.load(sys.stdin)['data']))")
+      echo "     models: $models"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[fail] bridge did not become healthy"
+  return 1
+}
+
+stop() {
+  for f in /run/opencode-free-bridge.pid /run/opencode-serve.pid; do
+    [ -f "$f" ] || continue
+    pid=$(cat "$f")
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      echo "killed pid $pid ($(basename "$f"))"
+    fi
+    rm -f "$f"
+  done
+  # also kill any straggler by port
+  for p in "${OC_PORT}" "${BRIDGE_PORT}"; do
+    pid=$(ss -ltnp 2>/dev/null | awk -v port=":${p} " '$4 ~ port {print $0}' | grep -oP 'pid=\K[0-9]+' | head -1)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  done
+}
+
+status() {
+  for p in "${OC_PORT}" "${BRIDGE_PORT}"; do
+    if ss -ltn 2>/dev/null | grep -q ":${p} "; then
+      echo "  :${p}  LISTEN"
+    else
+      echo "  :${p}  DOWN"
+    fi
+  done
+  curl -s "http://127.0.0.1:${BRIDGE_PORT}/healthz" 2>/dev/null || true
+  echo
+}
+
+case "${1:-start}" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) stop; sleep 1; start ;;
+  status)  status ;;
+  logs)    tail -n 50 -F "$BRIDGE_LOG" "$OC_LOG" ;;
+  *)       echo "usage: $0 [start|stop|restart|status|logs]"; exit 1 ;;
+esac

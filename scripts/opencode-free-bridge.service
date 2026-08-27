@@ -1,0 +1,15 @@
+[Unit]
+Description=opencode-free-bridge (OpenAI-compatible proxy for opencode free models)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/opencode-free-bridge start
+ExecStop=/usr/local/bin/opencode-free-bridge stop
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
