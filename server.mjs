@@ -46,11 +46,15 @@ async function loadOcGoModels() {
     const res = await fetch(`${OPENCODE_GO_BASE}/models`, { headers: { 'Authorization': `Bearer ${OPENCODE_GO_KEY}` } });
     if (!res.ok) throw new Error(`models ${res.status}`);
     const j = await res.json();
-    ocGoModels = (j.data || []).map(m => ({
-      id: m.id,
-      context: m.context_length || 200000,
-      output: (m.capabilities && m.capabilities.max_output_tokens) || 32000,
-    }));
+    // Drop models known to 500 upstream (e.g. muse-spark-1.2-contributor); the
+    // working free variant muse-spark-1.2-contributor-free is served separately.
+    ocGoModels = (j.data || [])
+      .filter(m => !/^muse-spark-1\.2-contributor$/.test(m.id))
+      .map(m => ({
+        id: m.id,
+        context: m.context_length || 200000,
+        output: (m.capabilities && m.capabilities.max_output_tokens) || 32000,
+      }));
     ocGoFetchedAt = Date.now();
     console.log(`[opencode-free-bridge] loaded ${ocGoModels.length} opencode-go models`);
   } catch (e) {
