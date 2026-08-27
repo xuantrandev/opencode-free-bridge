@@ -3,9 +3,11 @@ Description=opencode-free-bridge (OpenAI-compatible proxy for opencode free mode
 After=network.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/opencode-free-bridge start
+Type=simple
+# Launcher backgrounds opencode serve + bridge itself, then exits; but we want
+# systemd to track the lifetime. `start` returns once both are listening, so we
+# use a small watchdog wrapper that keeps the unit alive by tailing the log.
+ExecStart=/bin/bash -c '/usr/local/bin/opencode-free-bridge start && tail -F /var/log/opencode-free-bridge.log'
 ExecStop=/usr/local/bin/opencode-free-bridge stop
 Restart=on-failure
 RestartSec=5

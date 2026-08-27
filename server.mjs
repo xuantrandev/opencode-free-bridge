@@ -10,15 +10,15 @@ const HOST = '127.0.0.1';
 const AGENT = 'general';
 const SYSTEM_DEFAULT = 'You are a helpful assistant.';
 
-// 6 free models from /config/providers (OpenCode Zen, $0 cost).
-// Only the IDs we need at runtime are listed; full metadata is fetched lazily.
+// Free models from /config/providers (OpenCode Zen, $0 cost) that are verified
+// working. nemotron-3-ultra-free / nemotron-3.5-lightning-free are intentionally
+// excluded: they crash the opencode serve session (connection drops, HTTP 000),
+// taking the whole bridge down.
 const FREE_MODELS = [
   { id: 'big-pickle',                          context: 200000, output: 32000 },
   { id: 'hy3-free',                            context: 190000, output: 64000 },
   { id: 'mimo-v2.5-free',                      context: 200000, output: 32000 },
   { id: 'muse-spark-1.2-contributor-free',     context: 1048576, output: 131072 },
-  { id: 'nemotron-3-ultra-free',               context: 1000000, output: 128000 },
-  { id: 'nemotron-3.5-lightning-free',         context: 262144, output: 262144 },
 ];
 
 // ---- opencode session pool (lazy, per-process) ----

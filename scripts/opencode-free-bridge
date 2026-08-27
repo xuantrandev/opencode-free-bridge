@@ -31,7 +31,9 @@ start() {
     echo "[bridge] already up on :${BRIDGE_PORT}"
   else
     echo "[bridge] starting on :${BRIDGE_PORT}"
-    ( cd "$BRIDGE_DIR" && nohup node server.mjs \
+    # NOTE: system node 22.22.2 has a libuv SIGABRT bug on server.mjs (uv__io_poll
+    # assertion). Run the bridge under `bun` instead, which is stable here.
+    ( cd "$BRIDGE_DIR" && nohup bun server.mjs \
       >> "$BRIDGE_LOG" 2>&1 & echo $! > /run/opencode-free-bridge.pid ) &
     wait
     sleep 1
