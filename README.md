@@ -23,10 +23,11 @@ you can drop it into anything that speaks OpenAI.
 
 ## Features
 
-- `GET /v1/models` — list the 6 free models
+- `GET /v1/models` — list the 4 free models
 - `POST /v1/chat/completions` — sync + streaming (`stream:true`, SSE)
 - `GET /healthz` — health probe
 - OpenAI Python / Node / curl clients work out of the box
+- **No API key** — talks to a local `opencode serve` upstream only
 - **Loopback only** — refuses any non-`127.0.0.1` / `::1` source with 403
 - Zero deps (Node 18+ builtins only)
 
@@ -34,14 +35,12 @@ you can drop it into anything that speaks OpenAI.
 
 All served by OpenCode Zen, no API key, no quota from your side:
 
-| ID                                  | Context  | Max output | Notes                        |
-| ----------------------------------- | -------- | ---------- | ---------------------------- |
-| `big-pickle`                        | 200K     | 32K        | reasoning                    |
-| `hy3-free`                          | 190K     | 64K        | reasoning                    |
-| `mimo-v2.5-free`                    | 200K     | 32K        | reasoning, audio/image in    |
-| `muse-spark-1.2-contributor-free`   | 1.0M     | 131K       | reasoning, multimodal (in)   |
-| `nemotron-3-ultra-free`             | 1.0M     | 128K       | reasoning                    |
-| `nemotron-3.5-lightning-free`       | 262K     | 262K       | reasoning                    |
+| ID                                | Context | Max output | Notes                      |
+| --------------------------------- | ------- | ---------- | -------------------------- |
+| `big-pickle`                      | 200K    | 32K        | reasoning                  |
+| `hy3-free`                        | 190K    | 64K        | reasoning                  |
+| `mimo-v2.5-free`                  | 200K    | 32K        | reasoning, audio/image in  |
+| `muse-spark-1.2-contributor-free` | 1.0M    | 131K       | reasoning, multimodal (in) |
 
 ## Install
 
@@ -56,7 +55,7 @@ sudo install -m 0755 <(curl -fsSL https://raw.githubusercontent.com/raksix/openc
 ## Run
 
 ```bash
-cp .env.example .env   # then edit secrets
+cp .env.example .env   # optional — defaults work for a local `opencode serve`
 opencode-free-bridge start     # starts opencode serve :4577 + bridge :5577
 opencode-free-bridge status    # ports + health
 opencode-free-bridge logs      # tail both logs
@@ -66,15 +65,13 @@ opencode-free-bridge restart
 
 ### Environment
 
-All settings are environment variables (see `.env.example`):
+All settings are environment variables (see `.env.example`). **No API key is
+required** — the bridge only talks to a local `opencode serve` upstream.
 
-| Var                      | Default                                  | Purpose                                              |
-| ------------------------ | ---------------------------------------- | ---------------------------------------------------- |
-| `PORT`                   | `5577`                                   | Bridge listen port (loopback only)                   |
-| `OPENCODE_UPSTREAM`      | `http://127.0.0.1:4577`                  | `opencode serve` base URL                            |
-| `OPENCODE_GO_BASE`       | `https://opencode.ai/zen/go/v1`          | opencode-go (paid) base URL                          |
-| `OPENCODE_GO_API_KEY`    | _(empty)_                                | opencode-go API key (or use `OPENCODE_KEY_FILE`)     |
-| `OPENCODE_KEY_FILE`      | `/root/.hermes/scripts/opencode.key`     | File holding the opencode-go key (alternative to env)|
+| Var                 | Default                       | Purpose                                |
+| ------------------- | ----------------------------- | -------------------------------------- |
+| `PORT`              | `5577`                        | Bridge listen port (loopback only)     |
+| `OPENCODE_UPSTREAM` | `http://127.0.0.1:4577`       | `opencode serve` base URL              |
 
 ### systemd (auto-start on boot)
 
