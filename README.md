@@ -56,12 +56,25 @@ sudo install -m 0755 <(curl -fsSL https://raw.githubusercontent.com/raksix/openc
 ## Run
 
 ```bash
+cp .env.example .env   # then edit secrets
 opencode-free-bridge start     # starts opencode serve :4577 + bridge :5577
 opencode-free-bridge status    # ports + health
 opencode-free-bridge logs      # tail both logs
 opencode-free-bridge stop
 opencode-free-bridge restart
 ```
+
+### Environment
+
+All settings are environment variables (see `.env.example`):
+
+| Var                      | Default                                  | Purpose                                              |
+| ------------------------ | ---------------------------------------- | ---------------------------------------------------- |
+| `PORT`                   | `5577`                                   | Bridge listen port (loopback only)                   |
+| `OPENCODE_UPSTREAM`      | `http://127.0.0.1:4577`                  | `opencode serve` base URL                            |
+| `OPENCODE_GO_BASE`       | `https://opencode.ai/zen/go/v1`          | opencode-go (paid) base URL                          |
+| `OPENCODE_GO_API_KEY`    | _(empty)_                                | opencode-go API key (or use `OPENCODE_KEY_FILE`)     |
+| `OPENCODE_KEY_FILE`      | `/root/.hermes/scripts/opencode.key`     | File holding the opencode-go key (alternative to env)|
 
 ### systemd (auto-start on boot)
 
