@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+# opencode-bridge: OpenAI-compatible API gateway with automatic model discovery.
+ARG NODE_IMAGE=node:22-bookworm-slim
+
+FROM ${NODE_IMAGE}
+
+LABEL org.opencontainers.image.title="opencode-free-bridge" \
+      org.opencontainers.image.description="OpenAI-compatible API gateway for OpenCode free models with automatic model discovery" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV NODE_ENV=production \
+    OPENCODE_FREE_BRIDGE_DIR=/app \
+    HOST=0.0.0.0 \
+    PORT=5577 \
+    LOG_FILE=-
+
+RUN groupadd --system --gid 10001 bridge \
+ && useradd --system --uid 10001 --gid bridge --home-dir /home/bridge --create-home --shell /usr/sbin/nologin bridge
+
+WORKDIR /app
+
+# Runtime code only. Zero npm dependencies (Node builtins), so no install step.
+COPY package.json ./
+COPY server.mjs cli.mjs bridge-cli ./
+COPY lib ./lib
+COPY docker/bridge-entrypoint.sh ./docker/bridge-entrypoint.sh
+
+# Read-only seed files copied into a fresh config volume on first boot.
+COPY config/models.default.json config/exclusions.json config/metadata.json /opt/bridge/seed/
+
+RUN chmod 0755 /app/bridge-cli /app/docker/bridge-entrypoint.sh \
+ && ln -s /app/bridge-cli /usr/local/bin/bridge-cli \
+ && mkdir -p /app/config /app/state /app/backups /app/logs /app/run \
+ && chown -R bridge:bridge /app /opt/bridge
+
+USER bridge
+
+EXPOSE 5577
+
+# Liveness only (never depends on the upstream provider, so a temporary
+# provider outage cannot mark the bridge unhealthy).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD ["bridge-cli", "health", "--quiet"]
+
+ENTRYPOINT ["/app/docker/bridge-entrypoint.sh"]

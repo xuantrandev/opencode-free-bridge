@@ -6,8 +6,13 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../lib/config.mjs';
 import { ModelRegistry } from '../lib/registry.mjs';
+import { createBridgeServer } from '../server.mjs';
+import { OpenCodeClient } from '../lib/opencode-client.mjs';
+import { createLogger } from '../lib/logger.mjs';
 
 export async function makeTempEnv(env = {}) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ofb-test-'));
@@ -224,6 +229,90 @@ export async function startMockUpstream(options = {}) {
     close: () => new Promise((resolve) => {
       server.closeAllConnections?.();
       server.close(() => resolve());
+    }),
+  };
+}
+
+const SILENT = createLogger({ silent: true });
+
+/**
+ * Start a full bridge server (HTTP) for tests.
+ * Returns { bridge, config, registry, temp, up, base } and registers cleanup
+ * on `t` when provided.
+ */
+export async function startBridgeServer(t, {
+  models = ['a-free', 'b-free'],
+  upstreamOptions = {},
+  env = {},
+  upstream = null,
+  localAddress = '127.0.0.1',
+} = {}) {
+  const up = upstream ?? await startMockUpstream(upstreamOptions);
+  if (!upstream && t) t.after(() => up.close());
+  const temp = await makeTempEnv({
+    UPSTREAM_RETRY_BASE_MS: '10',
+    HEALTH_CACHE_MS: '0',
+    ...env,
+  });
+  if (t) t.after(() => temp.cleanup());
+  writeRegistry(temp.dir, models);
+  const config = { ...temp.config, port: 0, upstream: up.url, logFile: '' };
+  const registry = new ModelRegistry({ paths: config.paths, logger: SILENT });
+  registry.load();
+  const client = new OpenCodeClient({
+    upstream: up.url,
+    provider: config.provider,
+    agent: config.agent,
+    timeoutMs: config.upstreamTimeoutMs,
+    connectTimeoutMs: config.upstreamConnectTimeoutMs,
+    retries: config.upstreamRetries,
+    retryBaseMs: config.upstreamRetryBaseMs,
+    logger: SILENT,
+  });
+  const bridge = createBridgeServer({ config, registry, logger: SILENT, client });
+  await bridge.listen(0, '127.0.0.1');
+  if (t) t.after(() => bridge.close());
+  return { bridge, config, registry, temp, up, base: `http://127.0.0.1:${bridge.port}`, localAddress };
+}
+
+/**
+ * Spawn the discovery agent (docker/opencode-agent.mjs) as a subprocess and
+ * wait until it logs its listen URL. Returns { child, port, base, stop }.
+ */
+export async function startDiscoveryAgent(env = {}, { timeoutMs = 5000 } = {}) {
+  const agentPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'docker', 'opencode-agent.mjs');
+  const child = spawn(process.execPath, [agentPath], {
+    env: { ...process.env, AGENT_PORT: '0', AGENT_HOST: '127.0.0.1', ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d.toString(); });
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+  const deadline = Date.now() + timeoutMs;
+  let port = null;
+  while (Date.now() < deadline && child.exitCode === null) {
+    const match = /url=http:\/\/[^:]+:(\d+)/.exec(stdout);
+    if (match) {
+      port = Number(match[1]);
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  if (port === null) {
+    child.kill('SIGKILL');
+    throw new Error(`discovery agent did not start: ${stdout}\n${stderr}`);
+  }
+  return {
+    child,
+    port,
+    base: `http://127.0.0.1:${port}`,
+    output: () => ({ stdout, stderr }),
+    stop: () => new Promise((resolve) => {
+      if (child.exitCode !== null) return resolve(child.exitCode);
+      child.once('exit', (code) => resolve(code));
+      child.kill('SIGTERM');
+      setTimeout(() => child.kill('SIGKILL'), 3000).unref?.();
     }),
   };
 }

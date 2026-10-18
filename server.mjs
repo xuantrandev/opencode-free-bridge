@@ -7,6 +7,9 @@
 // restarting the process.
 
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './lib/config.mjs';
 import { createLogger } from './lib/logger.mjs';
@@ -14,11 +17,24 @@ import { ModelRegistry, registryHash } from './lib/registry.mjs';
 import { OpenCodeClient, extractText } from './lib/opencode-client.mjs';
 import { mapUpstreamError, openaiErrorBody, sanitizeMessage } from './lib/upstream.mjs';
 import { ModelSyncService } from './lib/sync.mjs';
+import { ensureDir } from './lib/fsutil.mjs';
 import { VERSION } from './lib/version.mjs';
 
 const SYSTEM_DEFAULT = 'You are a helpful assistant.';
-const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
+/** Constant-time string comparison (hashed first so lengths never leak). */
+export function constantTimeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a ?? ''), 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(String(b ?? ''), 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+export function extractBearerToken(header) {
+  if (typeof header !== 'string') return null;
+  const match = /^bearer[ \t]+(.+)$/i.exec(header.trim());
+  return match ? match[1].trim() : null;
+}
 
 function jsonResponse(res, status, body, extraHeaders = {}) {
   const buf = Buffer.from(JSON.stringify(body));
@@ -107,6 +123,57 @@ export function createBridgeServer({
   let sharedSessionLock = null;
   let upstreamCache = { at: 0, result: null };
   const inflight = new Set();
+  const maxBodyBytes = Math.max(1024, config.requestBodyLimitBytes ?? 10 * 1024 * 1024);
+  const rateLimitRpm = Math.max(0, config.rateLimitRpm ?? 0);
+  const rateBuckets = new Map();
+
+  // ------------------------------------------------------------ security
+
+  function clientAllowed(remote) {
+    if (config.allowNonLoopback) return true;
+    return LOOPBACK.has(remote);
+  }
+
+  function authorized(req) {
+    if (!config.apiKey) return true;
+    const token = extractBearerToken(req.headers.authorization);
+    if (token == null) return false;
+    // Never log or echo either value; compare in constant time.
+    return constantTimeEqual(token, config.apiKey);
+  }
+
+  function checkRateLimit(key) {
+    if (!rateLimitRpm) return { ok: true };
+    const now = Date.now();
+    let bucket = rateBuckets.get(key);
+    if (!bucket || now >= bucket.resetAt) {
+      if (rateBuckets.size > 10_000) {
+        for (const [k, v] of rateBuckets) if (now >= v.resetAt) rateBuckets.delete(k);
+      }
+      bucket = { count: 0, resetAt: now + 60_000 };
+      rateBuckets.set(key, bucket);
+    }
+    bucket.count += 1;
+    if (bucket.count > rateLimitRpm) {
+      return { ok: false, retryAfter: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)) };
+    }
+    return { ok: true, remaining: rateLimitRpm - bucket.count };
+  }
+
+  function corsHeaders(req) {
+    const origin = req.headers.origin;
+    if (!origin || typeof origin !== 'string') return {};
+    const allowed = Array.isArray(config.corsAllowedOrigins) ? config.corsAllowedOrigins : [];
+    if (allowed.length === 0) return {};
+    if (!allowed.includes(origin) && !allowed.includes('*')) return {};
+    return {
+      'Access-Control-Allow-Origin': allowed.includes('*') ? '*' : origin,
+      Vary: 'Origin',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      'Access-Control-Max-Age': '600',
+    };
+  }
 
   // ------------------------------------------------------------ sessions
 
@@ -209,7 +276,7 @@ export function createBridgeServer({
 
   // ------------------------------------------------------------ handlers
 
-  function handleListModels(req, res) {
+  function handleListModels(req, res, cors = {}) {
     registry.reloadFromDisk();
     const data = registry.models.map((m) => ({
       id: m.id,
@@ -222,13 +289,13 @@ export function createBridgeServer({
       status: m.status ?? 'discovered',
       verified: m.status === 'verified',
     }));
-    jsonResponse(res, 200, { object: 'list', data });
+    jsonResponse(res, 200, { object: 'list', data }, cors);
   }
 
-  function handleGetModel(req, res, id) {
+  function handleGetModel(req, res, id, cors = {}) {
     registry.reloadFromDisk();
     const m = registry.get(id);
-    if (!m) return jsonResponse(res, 404, openaiErrorBody(`model '${id}' not found`, 'invalid_request_error', 'model_not_found', 'model'));
+    if (!m) return jsonResponse(res, 404, openaiErrorBody(`model '${id}' not found`, 'invalid_request_error', 'model_not_found', 'model'), cors);
     return jsonResponse(res, 200, {
       id: m.id,
       object: 'model',
@@ -238,30 +305,99 @@ export function createBridgeServer({
       max_output_tokens: m.output ?? null,
       free: true,
       status: m.status ?? 'discovered',
-    });
+    }, cors);
   }
 
+  /**
+   * Liveness + rich status. Always HTTP 200 while the process serves; the
+   * `status` field degrades when the upstream is unreachable. Never triggers
+   * inference (or paid tokens) — only the cheap upstream health probe.
+   */
   async function handleHealth(req, res) {
     const upstream = await checkUpstream();
     const sync = syncService ? syncService.getStatus() : null;
     const hash = registryHash(registry.models);
+    const registryOk = registry.loadedFrom !== null;
     jsonResponse(res, 200, {
       status: upstream.ok ? 'ok' : 'degraded',
+      ok: true,
+      bridge: {
+        ok: true,
+        version: VERSION,
+        pid: process.pid,
+        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+        startedAt: new Date(startedAt).toISOString(),
+      },
       upstream: upstream.ok ? 'connected' : 'disconnected',
+      upstreamDetail: {
+        ok: upstream.ok,
+        latencyMs: upstream.latencyMs ?? null,
+        version: upstream.version ?? null,
+        checkedPath: upstream.path ?? null,
+      },
       upstreamLatencyMs: upstream.latencyMs ?? null,
       upstreamVersion: upstream.version ?? null,
+      registry: {
+        ok: registryOk,
+        empty: registry.models.length === 0,
+        source: registry.loadedFrom ? path.basename(registry.loadedFrom) : null,
+        loadedFrom: registry.loadedFrom,
+        generation: registry.registry.generation ?? 0,
+        hash,
+        models: registry.models.length,
+        verified: registry.models.filter((m) => m.status === 'verified').length,
+        discovered: registry.models.filter((m) => m.status === 'discovered').length,
+        lastUpdated: registry.registry.lastUpdated ?? null,
+      },
       modelSync: config.autoSync ? 'enabled' : 'disabled',
+      modelSyncDetail: sync ?? {
+        enabled: false,
+        running: false,
+        intervalMinutes: config.syncIntervalMinutes,
+      },
+      discovery: {
+        mode: sync?.discoveryMode ?? (config.discoveryUrl ? 'agent' : 'cli'),
+        url: config.discoveryUrl || null,
+      },
       modelCount: registry.models.length,
       modelCountVerified: registry.models.filter((m) => m.status === 'verified').length,
       lastSync: registry.registry.lastSync,
       lastSyncStatus: registry.registry.lastSyncStatus ?? null,
       lastSyncError: registry.registry.lastSyncError ?? null,
+      lastSyncResult: sync?.lastResult ?? null,
       registryHash: hash,
       generation: registry.registry.generation ?? 0,
       sessionMode: config.sessionMode,
       nextSyncAt: sync?.nextRunAt ?? null,
       syncRunning: sync?.running ?? false,
       uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+      version: VERSION,
+    });
+  }
+
+  /**
+   * Readiness: 200 only when the bridge can actually serve chat requests —
+   * the registry has models and the upstream is reachable. Returns 503
+   * otherwise so orchestrators stop routing traffic without flapping healthy
+   * containers during a temporary provider outage (liveness stays /health).
+   */
+  async function handleReady(req, res) {
+    const upstream = await checkUpstream();
+    const registryOk = registry.models.length > 0;
+    const ready = upstream.ok && registryOk;
+    jsonResponse(res, ready ? 200 : 503, {
+      ready,
+      status: ready ? 'ready' : 'not-ready',
+      checks: {
+        bridge: true,
+        registry: registryOk,
+        upstream: upstream.ok,
+      },
+      modelCount: registry.models.length,
+      registryHash: registryHash(registry.models),
+      lastSync: registry.registry.lastSync,
+      lastSyncStatus: registry.registry.lastSyncStatus ?? null,
+      upstreamLatencyMs: upstream.latencyMs ?? null,
       version: VERSION,
     });
   }
@@ -277,29 +413,46 @@ export function createBridgeServer({
     });
   }
 
-  async function handleChatCompletions(req, res) {
+  function rejectOversizedBody(req, res, cors) {
+    req.on('error', () => {});
+    if (!res.writableEnded) {
+      jsonResponse(res, 413, openaiErrorBody('request body too large', 'invalid_request_error', 'payload_too_large'), cors);
+    }
+    req.resume();
+  }
+
+  async function handleChatCompletions(req, res, cors = {}) {
     let raw = '';
     let size = 0;
-    for await (const chunk of req) {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        return jsonResponse(res, 413, openaiErrorBody('request body too large', 'invalid_request_error', 'payload_too_large'));
+    const declaredLength = Number(req.headers['content-length']);
+    if (Number.isFinite(declaredLength) && declaredLength > maxBodyBytes) {
+      return rejectOversizedBody(req, res, cors);
+    }
+    try {
+      for await (const chunk of req) {
+        size += chunk.length;
+        if (size > maxBodyBytes) {
+          return rejectOversizedBody(req, res, cors);
+        }
+        raw += chunk;
       }
-      raw += chunk;
+    } catch {
+      if (!res.headersSent) return jsonResponse(res, 400, openaiErrorBody('failed to read request body', 'invalid_request_error', 'invalid_body'), cors);
+      return res.end();
     }
     let body;
     try {
       body = JSON.parse(raw);
     } catch {
-      return jsonResponse(res, 400, openaiErrorBody('invalid JSON in request body', 'invalid_request_error', 'invalid_json'));
+      return jsonResponse(res, 400, openaiErrorBody('invalid JSON in request body', 'invalid_request_error', 'invalid_json'), cors);
     }
     if (!body || typeof body !== 'object') {
-      return jsonResponse(res, 400, openaiErrorBody('request body must be a JSON object'));
+      return jsonResponse(res, 400, openaiErrorBody('request body must be a JSON object'), cors);
     }
 
     registry.reloadFromDisk();
     if (!body.model || typeof body.model !== 'string') {
-      return jsonResponse(res, 400, openaiErrorBody("you must provide a 'model' parameter", 'invalid_request_error', 'missing_model', 'model'));
+      return jsonResponse(res, 400, openaiErrorBody("you must provide a 'model' parameter", 'invalid_request_error', 'missing_model', 'model'), cors);
     }
     if (!registry.has(body.model)) {
       const available = registry.models.map((m) => m.id).slice(0, 50).join(', ');
@@ -308,7 +461,7 @@ export function createBridgeServer({
         'invalid_request_error',
         'model_not_found',
         'model',
-      ));
+      ), cors);
     }
 
     let parts;
@@ -318,28 +471,28 @@ export function createBridgeServer({
         systemDefault: SYSTEM_DEFAULT,
       }));
     } catch (err) {
-      return jsonResponse(res, 400, openaiErrorBody(err?.message || 'invalid messages', 'invalid_request_error', 'invalid_messages'));
+      return jsonResponse(res, 400, openaiErrorBody(err?.message || 'invalid messages', 'invalid_request_error', 'invalid_messages'), cors);
     }
 
     const stream = body.stream === true;
     const requestId = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     inflight.add(requestId);
     try {
-      if (!stream) return await handleNonStreaming(res, { body, parts, requestId });
+      if (!stream) return await handleNonStreaming(res, { body, parts, requestId, cors });
       return await handleStreaming(res, { body, parts, requestId });
     } finally {
       inflight.delete(requestId);
     }
   }
 
-  async function handleNonStreaming(res, { body, parts, requestId }) {
+  async function handleNonStreaming(res, { body, parts, requestId, cors = {} }) {
     const result = await sendWithSession({ modelId: body.model, parts });
     if (!result.ok) {
       const mapped = mapUpstreamError(result, { model: body.model, logger });
-      return jsonResponse(res, mapped.status, mapped.body);
+      return jsonResponse(res, mapped.status, mapped.body, cors);
     }
     if (!result.json || typeof result.json !== 'object') {
-      return jsonResponse(res, 502, openaiErrorBody('malformed upstream response', 'api_error', 'upstream_malformed'));
+      return jsonResponse(res, 502, openaiErrorBody('malformed upstream response', 'api_error', 'upstream_malformed'), cors);
     }
     const info = result.json.info ?? {};
     const text = extractText(result.json.parts);
@@ -359,7 +512,7 @@ export function createBridgeServer({
         completion_tokens: usage.output || 0,
         total_tokens: usage.total || ((usage.input || 0) + (usage.output || 0)),
       },
-    });
+    }, cors);
   }
 
   async function handleStreaming(res, { body, parts, requestId }) {
@@ -405,7 +558,7 @@ export function createBridgeServer({
 
   const server = http.createServer(async (req, res) => {
     const remote = req.socket.remoteAddress;
-    if (!LOOPBACK.has(remote)) {
+    if (!clientAllowed(remote)) {
       return jsonResponse(res, 403, openaiErrorBody('loopback only', 'permission_error', 'forbidden'));
     }
     let url;
@@ -415,21 +568,40 @@ export function createBridgeServer({
       return jsonResponse(res, 400, openaiErrorBody('bad request url'));
     }
 
+    const cors = corsHeaders(req);
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': 'http://127.0.0.1',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      });
+      res.writeHead(204, cors);
       return res.end();
     }
 
+    const isV1 = url.pathname === '/v1' || url.pathname.startsWith('/v1/');
+    if (isV1) {
+      if (!authorized(req)) {
+        return jsonResponse(
+          res,
+          401,
+          openaiErrorBody('missing or invalid API key', 'authentication_error', 'invalid_api_key'),
+          { 'WWW-Authenticate': 'Bearer', ...cors },
+        );
+      }
+      const limit = checkRateLimit(remote);
+      if (!limit.ok) {
+        return jsonResponse(
+          res,
+          429,
+          openaiErrorBody(`rate limit exceeded (${rateLimitRpm} requests/minute); retry later`, 'rate_limit_error', 'rate_limit_exceeded'),
+          { 'Retry-After': String(limit.retryAfter), ...cors },
+        );
+      }
+    }
+
     try {
-      if (url.pathname === '/v1/models' && req.method === 'GET') return handleListModels(req, res);
+      if (url.pathname === '/v1/models' && req.method === 'GET') return handleListModels(req, res, cors);
       const modelMatch = /^\/v1\/models\/([^/]+)$/.exec(url.pathname);
-      if (modelMatch && req.method === 'GET') return handleGetModel(req, res, decodeURIComponent(modelMatch[1]));
-      if (url.pathname === '/v1/chat/completions' && req.method === 'POST') return await handleChatCompletions(req, res);
+      if (modelMatch && req.method === 'GET') return handleGetModel(req, res, decodeURIComponent(modelMatch[1]), cors);
+      if (url.pathname === '/v1/chat/completions' && req.method === 'POST') return await handleChatCompletions(req, res, cors);
       if (url.pathname === '/health' && req.method === 'GET') return await handleHealth(req, res);
+      if (url.pathname === '/health/ready' && req.method === 'GET') return await handleReady(req, res);
       if (url.pathname === '/healthz' && req.method === 'GET') return handleHealthz(req, res);
       return jsonResponse(res, 404, openaiErrorBody('not found', 'invalid_request_error', 'not_found'));
     } catch (err) {
@@ -505,7 +677,22 @@ async function main() {
   const syncService = new ModelSyncService({ config, registry, client, logger, selfUrl: `http://127.0.0.1:${config.port}` });
   const bridge = createBridgeServer({ config, registry, logger, client, syncService, watch: false });
   const addr = await bridge.listen();
-  logger.info('listening', { url: `http://${config.host}:${addr.port}`, upstream: config.upstream, models: registry.models.length, pid: process.pid });
+  const pidFile = path.join(config.paths.runDir, 'bridge.pid');
+  try {
+    ensureDir(config.paths.runDir);
+    fs.writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o644 });
+  } catch (err) {
+    logger.warn?.('could not write pid file', { file: pidFile, error: err?.message });
+  }
+  logger.info('listening', {
+    url: `http://${config.host}:${addr.port}`,
+    upstream: config.upstream,
+    models: registry.models.length,
+    discovery: syncService.discoveryMode,
+    auth: config.apiKey ? 'api-key' : 'none',
+    rateLimitRpm: config.rateLimitRpm,
+    pid: process.pid,
+  });
   logger.info('models', { ids: registry.models.map((m) => m.id) });
 
   syncService.start();
@@ -516,6 +703,9 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info('shutting down', { signal });
+    try {
+      fs.unlinkSync(pidFile);
+    } catch { /* already gone */ }
     await bridge.close();
     registry.close();
     logger.close();

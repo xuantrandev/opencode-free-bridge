@@ -1,8 +1,9 @@
 # opencode-free-bridge
 
 Self-maintaining **OpenAI-compatible HTTP API** for the free models exposed by
-the [`opencode`](https://github.com/sst/opencode) CLI. No API key. Loopback
-only. Zero runtime dependencies (Node builtins only).
+the [`opencode`](https://github.com/sst/opencode) CLI. Zero runtime
+dependencies (Node builtins only). Runs as a systemd service on bare metal or
+as a two-container Docker Compose stack.
 
 It translates the industry-standard OpenAI Chat Completions API onto the local
 `opencode serve` REST API (`/session`, `/session/{id}/message`, ...), and it
@@ -29,11 +30,16 @@ and rolled back automatically if a deployment breaks anything.
 - `GET /v1/models/{id}` — one model, 404 for unknown ids
 - `POST /v1/chat/completions` — non-streaming and `stream: true` (SSE)
 - `GET /health` — rich status (upstream, sync state, registry hash)
+- `GET /health/ready` — readiness probe (503 until registry + upstream ready)
 - `GET /healthz` — plain 200 liveness probe (compat)
 - OpenAI Python / Node / curl clients work unchanged
 - **Self-maintaining model registry** — new free models show up automatically
 - **Safe deploys** — atomic writes, backups, post-deploy HTTP verification,
   automatic rollback, last-known-good fallback chain
+- **Docker Compose deployment** — bridge + `opencode serve` side by side,
+  free-model discovery over an internal authenticated agent
+- **Optional hardening** — bearer API key, per-IP rate limiting, CORS
+  allowlist, body-size cap (all off/unlimited by default)
 
 ## How auto-maintenance works
 
@@ -64,6 +70,28 @@ Parents that prefer scheduled syncs can set `MODEL_AUTO_SYNC=false` and enable
 `opencode-free-bridge-sync.timer` instead (see systemd below).
 
 ## Quick start
+
+### Docker (recommended)
+
+```bash
+git clone https://github.com/raksix/opencode-free-bridge.git
+cd opencode-free-bridge
+cp .env.example .env          # optionally set BRIDGE_API_KEY / DISCOVERY_TOKEN
+docker compose up -d --build
+curl -s http://127.0.0.1:5577/health | jq
+```
+
+Two containers come up: `opencode-server` (runs `opencode serve` plus an
+internal authenticated discovery agent) and `opencode-bridge` (the HTTP API,
+published on `127.0.0.1:5577` by default). Both have liveness healthchecks;
+the bridge waits for the server to be healthy before starting. Model registry,
+state, backups and opencode credentials all live in named volumes, so
+`docker compose down` + `up` (or image upgrades) keep them.
+
+If your opencode account needs a login, see
+[OpenCode authentication](#opencode-authentication).
+
+### Bare metal (systemd)
 
 ```bash
 git clone https://github.com/raksix/opencode-free-bridge.git
@@ -96,22 +124,125 @@ step aside and point you at `systemctl` instead of fighting over the ports.
 ## CLI
 
 ```
-opencode-free-bridge status                 # bridge + upstream health summary
-opencode-free-bridge models                 # registry table (id, ctx, max output, status)
-opencode-free-bridge models list --json     # machine-readable registry
-opencode-free-bridge models sync            # discover → verify → deploy now
-opencode-free-bridge models status          # sync state, lock, last run
-opencode-free-bridge models verify <id|all> # re-probe one model or all
+opencode-free-bridge status                  # bridge + upstream health summary
+opencode-free-bridge health [--json]         # liveness/readiness, exit 0/1 for scripts
+opencode-free-bridge health --ready          # exit 1 until models + upstream are ready
+opencode-free-bridge models                  # registry table (id, ctx, max output, status)
+opencode-free-bridge models list --json      # machine-readable registry
+opencode-free-bridge models sync             # discover → verify → deploy now
+opencode-free-bridge models status           # sync state, lock, last run
+opencode-free-bridge models verify <id|all>  # re-probe one model or all
 opencode-free-bridge models exclude <id|pattern> [--reason "..."]
 opencode-free-bridge models include <id|pattern>
-opencode-free-bridge reload                 # SIGHUP the bridge (reload registry)
-opencode-free-bridge logs [-n N]            # tail bridge + opencode logs
+opencode-free-bridge config verify [--online] # validate registry/exclusions/metadata files
+opencode-free-bridge reload                  # SIGHUP the bridge (reload registry)
+opencode-free-bridge restart                 # graceful SIGTERM (Docker restarts it)
+opencode-free-bridge logs [-n N]             # tail bridge + opencode logs
 opencode-free-bridge version
 ```
 
 `models sync` runs outside the bridge under a cross-process lock, so CLI syncs
 and the in-server auto-sync never race. Exit code is `1` when a run fails or
-rolls back, `0` for `ok`/`unchanged`.
+rolls back, `0` for `ok`/`unchanged`. `health --quiet` and
+`config verify` are designed for scripts and Docker healthchecks.
+
+Inside a container, use the short alias (kept in sync with the CLI):
+
+```bash
+docker compose exec opencode-bridge bridge-cli status
+docker compose exec opencode-bridge bridge-cli models sync
+```
+
+## Docker
+
+### Services
+
+| Service | Image | Role | Network |
+| --- | --- | --- | --- |
+| `opencode-server` | `Dockerfile.opencode` | `opencode serve` on `4577` + discovery agent on `4578` | internal only |
+| `opencode-bridge` | `Dockerfile.bridge` | the OpenAI-compatible API on `5577` | published to `127.0.0.1:5577` |
+
+Because the bridge cannot execute the `opencode` CLI from its own container,
+discovery goes through a small authenticated HTTP agent that runs next to
+`opencode serve`. The agent executes `opencode models opencode [--verbose]`
+and returns raw stdout; parsing and free/paid classification still happen in
+`lib/discovery.mjs` inside the bridge. The agent is the only component that
+knows `DISCOVERY_TOKEN`; it is never exposed outside the Compose network.
+
+Both containers run as non-root, drop nothing else, and the bridge's root
+filesystem is read-only (`tmpfs` for `/tmp`). Writable state lives in named
+volumes:
+
+| Volume | Mount | Contents |
+| --- | --- | --- |
+| `bridge-config` | `/app/config` | `models.json`, `exclusions.json`, `metadata.json` (seeded on first boot) |
+| `bridge-state` | `/app/state` | verification state, sync lock |
+| `bridge-backups` | `/app/backups` | timestamped registry backups |
+| `bridge-logs` | `/app/logs` | log file (only if you set `LOG_FILE` to a path) |
+| `bridge-run` | `/app/run` | `bridge.pid` |
+| `opencode-data` | `/home/opencode/.local/share/opencode` | opencode credentials/auth + DB |
+| `opencode-config` | `/home/opencode/.config/opencode` | `opencode.jsonc` |
+| `opencode-cache` / `opencode-state` | `~/.cache/opencode`, `~/.local/state/opencode` | caches and logs |
+
+### Configuration
+
+Everything is driven by `.env` (see `.env.example`; `.env` is excluded from
+Docker builds and never baked into images):
+
+```bash
+cp .env.example .env
+# Recommended in Docker:
+BRIDGE_BIND=127.0.0.1          # keep the API loopback-only on the host
+BRIDGE_PORT=5577
+BRIDGE_API_KEY=                # leave empty for local-only use
+DISCOVERY_TOKEN=change-me      # replace; shared secret for the discovery agent
+OPENCODE_VERSION=1.19.3        # opencode CLI version installed in the image
+IMAGE_TAG=latest
+```
+
+Inside Compose, `ALLOW_NON_LOOPBACK=true` is set for the bridge because
+clients arrive with the Docker gateway address — the loopback guarantee is
+provided by the host port binding (`BRIDGE_BIND=127.0.0.1`). If you change
+`BRIDGE_BIND` to a public address, set `BRIDGE_API_KEY` too; the config warns
+when it is missing.
+
+### Management
+
+```bash
+docker compose ps                       # container state
+docker compose logs -f opencode-bridge  # bridge logs (stdout)
+docker compose exec opencode-bridge bridge-cli health
+docker compose exec opencode-bridge bridge-cli models
+docker compose exec opencode-bridge bridge-cli models sync
+docker compose exec opencode-bridge bridge-cli config verify
+docker compose exec opencode-bridge bridge-cli restart   # SIGTERM; restart policy revives
+docker compose down                     # keeps volumes (registry + auth persist)
+docker compose up -d --build            # upgrade to new code/images
+```
+
+Healthchecks are liveness-only (`bridge-cli health --quiet` and the agent's
+`healthcheck` mode), so a temporary provider outage does not cause container
+restarts. Orchestrators that gate traffic should poll `/health/ready`
+instead, which requires a non-empty registry and a connected upstream.
+
+### OpenCode authentication
+
+If `opencode` inside the container has no credentials, models may be missing
+or inference will fail. Migrate an existing host login (recommended):
+
+```bash
+./scripts/migrate-auth.sh                 # copies ~/.local/share/opencode/auth.json into the volume
+./scripts/migrate-auth.sh --with-config   # also copies ~/.config/opencode
+./scripts/migrate-auth.sh --force         # overwrite an existing container auth.json
+```
+
+The script never prints secret material, refuses to overwrite without
+`--force`, and verifies with `docker compose exec opencode-server opencode
+models opencode`. Without a host login, authenticate interactively:
+
+```bash
+docker compose exec opencode-server opencode auth login
+```
 
 ## Model registry
 
@@ -177,8 +308,17 @@ variables override `.env`. **No API key is required.**
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `PORT` | `5577` | Bridge listen port (loopback only) |
+| `HOST` | `127.0.0.1` | Listen address (containers use `0.0.0.0` + port binding) |
+| `ALLOW_NON_LOOPBACK` | `false` | Accept non-loopback clients (needed in Docker; warns without an API key) |
+| `BRIDGE_API_KEY` | *(unset)* | Require `Authorization: Bearer <key>` on `/v1/*` (health stays open) |
+| `BRIDGE_API_KEY_FILE` | *(unset)* | Read the API key from a Docker secret file instead |
+| `RATE_LIMIT_RPM` | `120` | Per-IP requests/minute on `/v1/*`; `0` disables |
+| `REQUEST_BODY_LIMIT_BYTES` | `10485760` | Max request body size (413 beyond it) |
+| `CORS_ALLOWED_ORIGINS` | *(empty)* | Comma-separated origin allowlist; empty = no CORS headers |
 | `OPENCODE_UPSTREAM` | `http://127.0.0.1:4577` | `opencode serve` base URL |
 | `OPENCODE_BIN` | `opencode` | CLI used for discovery (auto-filled by installer) |
+| `DISCOVERY_URL` | *(unset)* | Discover through an internal agent instead of the local CLI (Docker) |
+| `DISCOVERY_TOKEN` | *(unset)* | Bearer token for the discovery agent (`DISCOVERY_TOKEN_FILE` also supported) |
 | `OPENCODE_PROVIDER` | `opencode` | Provider whose models are synced |
 | `OPENCODE_AGENT` | `general` | Agent used for upstream messages |
 | `MODEL_AUTO_SYNC` | `true` | In-server periodic sync |
@@ -202,7 +342,7 @@ variables override `.env`. **No API key is required.**
 | `INCLUDE_HISTORY` | `true` | Send prior turns with each request |
 | `BACKUP_KEEP` | `20` | Registry backups to retain |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
-| `LOG_FILE` | `logs/bridge.log` | Set `-` to log to stdout |
+| `LOG_FILE` | `logs/bridge.log` | Set `-` to log to stdout (containers do this) |
 
 ## Usage
 
@@ -299,18 +439,25 @@ The registry (`config/models.json`, backups, state) is untouched by upgrades.
 ```json
 {
   "status": "ok",
-  "bridge": "opencode-free-bridge/2.0.0",
+  "ok": true,
+  "bridge": { "ok": true, "version": "2.1.0", "pid": 123, "uptimeSeconds": 42 },
   "upstream": "connected",
   "upstreamVersion": "1.19.0",
   "modelCount": 7,
   "registryHash": "fb1a1ea4ce8fe629",
-  "modelSync": { "enabled": true, "intervalMinutes": 60, "lastSync": { "status": "unchanged" } }
+  "registry": { "ok": true, "source": "config/models.json", "generation": 3, "models": 7 },
+  "discovery": { "mode": "agent" },
+  "modelSync": "enabled",
+  "lastSync": { "status": "unchanged", "...": "..." }
 }
 ```
 
 `status` flips to `degraded` (HTTP 200 for probes, details in the body) when
 the upstream is unreachable; `GET /healthz` stays a plain 200 for dumb
-liveness checks.
+liveness checks. `GET /health/ready` returns `200 {"ready": true}` only when
+the bridge is up, the registry has at least one model and the upstream is
+connected — otherwise `503`. Docker healthchecks use liveness; use
+`/health/ready` when routing traffic.
 
 ## Errors
 
@@ -320,15 +467,30 @@ OpenAI-shaped error objects with useful messages:
 - `502` — upstream unreachable/failed
 - `504` — upstream timeout
 - `500` — upstream error (the upstream `ref` id is extracted and logged)
+- `401` — missing/wrong `Authorization: Bearer <BRIDGE_API_KEY>` on `/v1/*`
+- `429` — rate limit exceeded (`Retry-After` header included)
+- `413` — request body larger than `REQUEST_BODY_LIMIT_BYTES`
 - `403` — non-loopback client
 
 ## Security
 
-- Listens on `127.0.0.1` only; non-loopback connections are rejected with 403.
-- No auth *because* it is loopback-only. If you ever expose it, put it behind
-  a reverse proxy with authentication — the bridge itself has no user auth.
-- No filesystem access in the request path, no shell exec beyond
-  `opencode models` for discovery, no env passthrough to clients.
+- Defaults to `127.0.0.1`; non-loopback connections are rejected with 403
+  unless `ALLOW_NON_LOOPBACK=true`.
+- With no API key, auth is implicit in the loopback-only bind. In Docker the
+  containers bind `0.0.0.0` and the host port binding keeps the same
+  guarantee; publishing to a public address without `BRIDGE_API_KEY` logs a
+  config warning.
+- Optional `BRIDGE_API_KEY` (constant-time compared) protects all `/v1/*`
+  routes. `/health`, `/healthz`, `/health/ready` stay open for healthchecks
+  but never include secrets.
+- Per-IP token-bucket rate limiting (`RATE_LIMIT_RPM`, default 120) and a
+  request body cap (default 10 MB) bound resource use; CORS is off unless
+  origins are explicitly allowlisted.
+- Secrets can come from files (`BRIDGE_API_KEY_FILE`, `DISCOVERY_TOKEN_FILE`)
+  for Docker/Swarm secrets; `.env` is excluded from build contexts.
+- No filesystem access in the request path, no shell exec beyond model
+  discovery (`opencode models` locally, the token-protected agent in Docker),
+  no env passthrough to clients.
 
 ## Architecture
 
@@ -342,6 +504,12 @@ OpenAI-shaped error objects with useful messages:
 | `lib/verify.mjs` | Model verification probes |
 | `lib/upstream.mjs` | Upstream HTTP client, retries, error mapping |
 | `lib/config.mjs` · `lib/logger.mjs` · `lib/fsutil.mjs` · `lib/opencode-client.mjs` | Config, logging, atomic FS helpers, upstream session client |
+| `lib/agent-discovery.mjs` | Discovery runner that talks to the internal agent (Docker) |
+| `docker/opencode-agent.mjs` | Internal authenticated agent: CLI proxy + `opencode serve` supervisor |
+| `Dockerfile.bridge` · `Dockerfile.opencode` · `docker-compose.yml` | Two-container deployment |
+| `docker/bridge-entrypoint.sh` · `docker/opencode-entrypoint.sh` | Volume seeding, XDG setup, exec |
+| `bridge-cli` | Short CLI alias used inside the bridge container |
+| `scripts/migrate-auth.sh` | One-shot host → volume opencode auth migration |
 | `scripts/opencode-free-bridge` | Launcher (standalone mode) + systemd-aware hints |
 | `scripts/opencode-*.service` · `scripts/opencode-free-bridge-sync.timer` | systemd units |
 | `scripts/install.sh` · `scripts/upgrade.sh` | Installer and safe upgrader |
@@ -354,11 +522,14 @@ that is deleted after the response, so no state leaks between clients.
 ## Tests
 
 ```bash
-node --test          # 82 tests: discovery, registry, sync, server, cli
+npm test                              # 117 tests: discovery, registry, sync, server, security, cli, agent
+RUN_DOCKER_TESTS=1 npm test           # + compose config validation & packaging invariants
+RUN_DOCKER_TESTS=1 RUN_DOCKER_FULL=1 npm test   # + full two-container boot & health
 ```
 
 Tests never touch real quota: the opencode CLI is mocked and upstream calls
-are stubbed unless a test explicitly targets the live integration path.
+are stubbed unless a test explicitly targets the live integration path. The
+discovery-agent tests spawn the real agent with a mocked CLI binary.
 
 ## Troubleshooting
 
@@ -372,6 +543,18 @@ are stubbed unless a test explicitly targets the live integration path.
   hot-reloads instantly.
 - **Bridge degraded after reboot** — `opencode-serve.service` may lack the
   CLI path; re-run `sudo ./scripts/install.sh` (it writes `OPENCODE_BIN`).
+- **Docker: `/v1/models` is empty** — the container has no opencode
+  credentials. Run `./scripts/migrate-auth.sh` or
+  `docker compose exec opencode-server opencode auth login`, then
+  `docker compose exec opencode-bridge bridge-cli models sync`.
+- **Docker: 403 on every request** — `ALLOW_NON_LOOPBACK` is not set for the
+  bridge (Compose sets it); for manual runs add it, or set
+  `BRIDGE_API_KEY` and expose through `BRIDGE_BIND`.
+- **Docker: discovery fails with 401** — `DISCOVERY_TOKEN` differs between
+  containers; recreate both: `docker compose up -d --force-recreate`.
+- **Docker: config invalid after hand-editing** — models.json is quarantined
+  on boot instead of crashing: `bridge-cli config verify` shows the problem,
+  `.corrupt.<timestamp>` files sit next to the seeded default.
 
 ## License
 

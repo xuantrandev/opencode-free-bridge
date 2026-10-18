@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+// bridge-cli — container-friendly entry point for the management CLI.
+//
+//   docker compose exec opencode-bridge bridge-cli models
+//   docker compose exec opencode-bridge bridge-cli sync
+//   docker compose exec opencode-bridge bridge-cli status
+//   docker compose exec opencode-bridge bridge-cli health --quiet
+//   docker compose exec opencode-bridge bridge-cli config verify
+//
+// On a plain host install the same commands are available as
+// `node cli.mjs <command>` or through scripts/opencode-free-bridge.
+
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const { runCli } = await import(path.join(here, 'cli.mjs'));
+
+runCli(process.argv.slice(2))
+  .then((code) => {
+    process.exitCode = code;
+  })
+  .catch((err) => {
+    console.error(`error: ${err?.message || err}`);
+    process.exitCode = 1;
+  });

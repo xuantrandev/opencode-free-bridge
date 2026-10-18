@@ -18,7 +18,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, matchesAny } from './lib/config.mjs';
 import { createLogger } from './lib/logger.mjs';
-import { ModelRegistry, registryHash } from './lib/registry.mjs';
+import { ModelRegistry, normalizeRegistry, registryHash } from './lib/registry.mjs';
 import { OpenCodeClient } from './lib/opencode-client.mjs';
 import { ModelSyncService, fetchJsonWithTimeout } from './lib/sync.mjs';
 import { createUpstreamTest, loadVerificationState, verifyModels, verificationSummary } from './lib/verify.mjs';
@@ -322,6 +322,147 @@ async function cmdModelsVerify(config) {
   return 0;
 }
 
+async function cmdHealth(config) {
+  const quiet = flag('--quiet');
+  const readyOnly = flag('--ready');
+  const health = await fetchJsonWithTimeout(`http://127.0.0.1:${config.port}/health`, { timeoutMs: 2500 });
+  const readiness = await fetchJsonWithTimeout(`http://127.0.0.1:${config.port}/health/ready`, { timeoutMs: 2500 });
+  const live = health.status === 200 && health.json?.ok !== false && health.json?.bridge?.ok !== false;
+  const readyOk = readiness.status === 200 && readiness.json?.ready === true;
+  const passed = readyOnly ? readyOk : live;
+  if (wantsJson) {
+    printJson({
+      live,
+      ready: readyOk,
+      health: health.status === 0 ? { error: health.error?.message || 'unreachable' } : health.json,
+      readiness: readiness.status === 0 ? { error: readiness.error?.message || 'unreachable' } : readiness.json,
+    });
+    return passed ? 0 : 1;
+  }
+  if (quiet) return passed ? 0 : 1;
+  if (health.status === 0) {
+    console.log(`bridge:   DOWN (${health.error?.message || 'unreachable'})`);
+    return 1;
+  }
+  const h = health.json ?? {};
+  console.log(`bridge:   UP (${h.bridge?.version ?? '?'}, up ${h.bridge?.uptimeSeconds ?? '?'}s, pid ${h.bridge?.pid ?? '?'})`);
+  console.log(`upstream: ${h.upstream ?? 'unknown'}${h.upstreamDetail?.latencyMs != null ? ` (${h.upstreamDetail.latencyMs}ms)` : ''}`);
+  console.log(`registry: ${h.modelCount ?? 0} models, generation ${h.registry?.generation ?? 0}, hash ${h.registryHash ?? '-'}`);
+  console.log(`last sync: ${h.lastSync || 'never'} (${h.lastSyncStatus || 'n/a'})${h.lastSyncError ? ` — ${h.lastSyncError}` : ''}`);
+  console.log(`ready:    ${readyOk ? 'yes' : 'no'}${readiness.json ? ` (${JSON.stringify(readiness.json.checks || {})})` : ''}`);
+  return passed ? 0 : 1;
+}
+
+function readJsonFileSafe(file) {
+  try {
+    return { ok: true, value: JSON.parse(fs.readFileSync(file, 'utf8')) };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+}
+
+async function cmdConfigVerify(config) {
+  const problems = [];
+  const notes = [];
+  const logger = createLogger({ silent: true });
+  const registry = makeRegistry(config, logger);
+
+  const modelsRead = fs.existsSync(config.paths.modelsFile) ? readJsonFileSafe(config.paths.modelsFile) : { ok: true, value: null };
+  if (!modelsRead.ok) problems.push(`config/models.json: ${modelsRead.error?.message || 'unreadable'}`);
+  const rawModels = modelsRead.value;
+  const { valid, errors } = rawModels ? normalizeRegistry(rawModels) : { valid: true, errors: [] };
+  if (rawModels && !valid) problems.push(`config/models.json: ${errors[0] || 'invalid'}`);
+  for (const error of errors.slice(0, 5)) notes.push(`models.json: ${error}`);
+
+  const exclusions = registry.exclusions;
+  for (const pattern of [...exclusions.exclude, ...exclusions.include]) {
+    if (typeof pattern !== 'string' || !pattern.trim()) problems.push('exclusions.json: patterns must be non-empty strings');
+    else if (pattern.startsWith('re:')) {
+      try { new RegExp(pattern.slice(3)); } catch (err) { problems.push(`exclusions.json: invalid regex '${pattern}' (${err.message})`); }
+    }
+  }
+  const exclusionsRead = fs.existsSync(config.paths.exclusionsFile) ? readJsonFileSafe(config.paths.exclusionsFile) : { ok: true, value: null };
+  if (!exclusionsRead.ok) problems.push(`config/exclusions.json: ${exclusionsRead.error?.message || 'unreadable'}`);
+  const rawExclusions = exclusionsRead.value;
+  if (rawExclusions && !Array.isArray(rawExclusions.exclude)) problems.push('exclusions.json: "exclude" must be an array');
+  if (rawExclusions && !Array.isArray(rawExclusions.include)) problems.push('exclusions.json: "include" must be an array');
+
+  const metadataRead = fs.existsSync(config.paths.metadataFile) ? readJsonFileSafe(config.paths.metadataFile) : { ok: true, value: null };
+  if (!metadataRead.ok) problems.push(`config/metadata.json: ${metadataRead.error?.message || 'unreadable'}`);
+  const rawMetadata = metadataRead.value;
+  if (rawMetadata !== null && (typeof rawMetadata !== 'object' || Array.isArray(rawMetadata))) {
+    problems.push('metadata.json: must be a JSON object keyed by model id');
+  }
+
+  for (const warning of config.warnings) notes.push(warning);
+
+  const out = {
+    ok: problems.length === 0,
+    problems,
+    notes,
+    config: {
+      host: config.host,
+      port: config.port,
+      upstream: config.upstream,
+      discovery: config.discoveryUrl || 'local opencode CLI',
+      apiKey: config.apiKey ? 'set' : 'unset',
+      rateLimitRpm: config.rateLimitRpm,
+      allowNonLoopback: config.allowNonLoopback,
+      corsAllowedOrigins: config.corsAllowedOrigins,
+      syncIntervalMinutes: config.syncIntervalMinutes,
+      paths: config.paths,
+    },
+    registry: {
+      source: registry.loadedFrom,
+      models: registry.models.length,
+      generation: registry.registry.generation ?? 0,
+      hash: registryHash(registry.models),
+    },
+    exclusions: { exclude: exclusions.exclude, include: exclusions.include },
+  };
+
+  if (flag('--online')) {
+    const upstream = await new OpenCodeClient({ upstream: config.upstream, logger }).health({ timeoutMs: 2500 });
+    out.upstream = { ok: upstream.ok, latencyMs: upstream.latencyMs ?? null, version: upstream.version ?? null };
+    if (!upstream.ok) notes.push(`upstream ${config.upstream} is not reachable right now`);
+  }
+
+  if (wantsJson) {
+    printJson(out);
+    return out.ok ? 0 : 1;
+  }
+  console.log(out.ok ? 'config: OK' : 'config: INVALID');
+  console.log(`  registry:   ${out.registry.models} models from ${out.registry.source || '(none)'}`);
+  console.log(`  exclusions: ${out.exclusions.exclude.join(', ') || '(none)'}`);
+  console.log(`  discovery:  ${out.config.discovery}`);
+  console.log(`  api key:    ${out.config.apiKey}`);
+  for (const p of problems) console.log(`  problem: ${p}`);
+  for (const n of notes) console.log(`  note:    ${n}`);
+  if (out.upstream) console.log(`  upstream:   ${out.upstream.ok ? `ok (${out.upstream.latencyMs}ms)` : 'unreachable'}`);
+  return out.ok ? 0 : 1;
+}
+
+async function cmdRestart(config) {
+  const pidFile = path.join(config.paths.runDir, 'bridge.pid');
+  let pid = null;
+  try {
+    pid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
+  } catch { /* no pid file */ }
+  if ((!pid || !Number.isFinite(pid)) && fs.existsSync('/.dockerenv')) pid = 1;
+  if (!pid || !Number.isFinite(pid)) {
+    console.error('bridge is not running (no pid file)');
+    return 1;
+  }
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (err) {
+    console.error(`failed to signal pid ${pid}: ${err.message}`);
+    return 1;
+  }
+  console.log(`sent SIGTERM to bridge pid ${pid} (graceful shutdown); the restart policy will bring it back`);
+  return 0;
+}
+
 async function cmdStatus(config) {
   const logger = createLogger({ silent: true });
   const registry = makeRegistry(config, logger);
@@ -363,6 +504,10 @@ async function cmdStatus(config) {
 function cmdLogs(config) {
   const n = flagValue('-n', '100');
   const follow = flag('-f');
+  if (!config.logFile || config.logFile === '-' || config.logFile === 'stdout' || config.logFile === 'stderr') {
+    console.log('logging to stdout (LOG_FILE=-). In Docker use: docker compose logs -f opencode-bridge');
+    return 0;
+  }
   const files = [config.logFile, path.join(config.paths.logsDir, 'opencode-serve.log')].filter((f) => {
     try {
       return fs.statSync(f).isFile();
@@ -420,6 +565,9 @@ commands:
   models include ID [--no-sync]       un-exclude / force-include a model
   models verify [ID...] [--json]      run inference verification
   status [--json]                     bridge + upstream health overview
+  health [--json] [--quiet] [--ready] liveness/readiness probe (exit code for scripts)
+  config verify [--json] [--online]   validate registry, exclusions, metadata, env
+  restart                             gracefully stop the bridge (restart policy revives it)
   logs [-n N] [-f]                    tail bridge logs (journalctl fallback)
   reload                              SIGHUP the bridge to reload the registry
   version                             print the bridge version
@@ -454,6 +602,20 @@ export async function runCli(args = argv, { env = process.env } = {}) {
       return cmdModelsSync(config);
     case 'status':
       return cmdStatus(config);
+    case 'health':
+    case 'healthz':
+      return cmdHealth(config);
+    case 'config':
+      switch (sub) {
+        case 'verify':
+        case 'check':
+          return cmdConfigVerify(config);
+        default:
+          console.error(`unknown config subcommand: ${sub ?? '(none)'} (expected: verify)`);
+          return usage();
+      }
+    case 'restart':
+      return cmdRestart(config);
     case 'logs':
       return cmdLogs(config);
     case 'reload':

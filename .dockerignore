@@ -1,0 +1,23 @@
+# Build context hygiene: keep secrets and runtime state out of image layers.
+.git
+.gitignore
+.env
+.env.local
+.env.*.local
+node_modules
+logs
+backups
+state
+run
+test
+scripts
+*.log
+config/models.json
+config/models.json.bak
+config/models.json.corrupt.*
+config/*.tmp
+README.md
+LICENSE
+docker-compose.yml
+.dockerignore
+Dockerfile*

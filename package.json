@@ -1,16 +1,24 @@
 {
   "name": "opencode-free-bridge",
-  "version": "2.0.0",
-  "description": "OpenAI-compatible API bridge for the free models exposed by the OpenCode CLI, with automatic model discovery and hot-reloading model registry.",
+  "version": "2.1.0",
+  "description": "OpenAI-compatible API bridge for the free models exposed by the OpenCode CLI, with automatic model discovery, hot-reloading model registry and a fully containerized Docker Compose deployment.",
   "type": "module",
   "private": true,
   "license": "MIT",
   "engines": {
     "node": ">=20"
   },
+  "bin": {
+    "bridge-cli": "./bridge-cli"
+  },
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test",
-    "check": "node --check server.mjs && node --check cli.mjs && node --check lib/config.mjs && node --check lib/logger.mjs && node --check lib/registry.mjs && node --check lib/discovery.mjs && node --check lib/sync.mjs && node --check lib/verify.mjs && node --check lib/upstream.mjs && node --check lib/opencode-client.mjs && node --check lib/fsutil.mjs"
+    "check": "node --check server.mjs && node --check cli.mjs && node --check bridge-cli && node --check lib/config.mjs && node --check lib/logger.mjs && node --check lib/registry.mjs && node --check lib/discovery.mjs && node --check lib/agent-discovery.mjs && node --check lib/sync.mjs && node --check lib/verify.mjs && node --check lib/upstream.mjs && node --check lib/opencode-client.mjs && node --check lib/fsutil.mjs && node --check docker/opencode-agent.mjs",
+    "docker:config": "docker compose config",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "docker:ps": "docker compose ps"
   }
 }

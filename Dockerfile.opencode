@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+# opencode-server: official OpenCode CLI running `opencode serve` plus the
+# token-protected internal discovery agent. The upstream port (4577) is only
+# reachable on the Docker-internal network; it is never published to the host.
+ARG NODE_IMAGE=node:22-bookworm-slim
+
+FROM ${NODE_IMAGE}
+
+# Pin the CLI version for reproducible builds. Override with:
+#   docker compose build --build-arg OPENCODE_VERSION=1.19.3
+ARG OPENCODE_VERSION=1.19.3
+
+LABEL org.opencontainers.image.title="opencode-server" \
+      org.opencontainers.image.description="OpenCode headless server + internal model discovery agent" \
+      org.opencontainers.image.licenses="MIT"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-fund --no-audit "opencode-ai@${OPENCODE_VERSION}" \
+ && npm cache clean --force \
+ && opencode --version
+
+RUN groupadd --system --gid 10001 opencode \
+ && useradd --system --uid 10001 --gid opencode --home-dir /home/opencode --create-home --shell /usr/sbin/nologin opencode
+
+COPY docker/opencode-agent.mjs docker/opencode-entrypoint.sh /opt/opencode/
+
+ENV HOME=/home/opencode \
+    XDG_DATA_HOME=/home/opencode/.local/share \
+    XDG_CONFIG_HOME=/home/opencode/.config \
+    XDG_CACHE_HOME=/home/opencode/.cache \
+    XDG_STATE_HOME=/home/opencode/.local/state \
+    OPENCODE_SERVE_HOSTNAME=0.0.0.0 \
+    OPENCODE_SERVE_PORT=4577 \
+    AGENT_HOST=0.0.0.0 \
+    AGENT_PORT=4578
+
+RUN mkdir -p \
+      /home/opencode/.local/share \
+      /home/opencode/.config \
+      /home/opencode/.cache \
+      /home/opencode/.local/state \
+ && chmod 0755 /opt/opencode/opencode-entrypoint.sh \
+ && chown -R opencode:opencode /home/opencode /opt/opencode
+
+USER opencode
+
+# Internal only: 4577 = opencode serve (upstream), 4578 = discovery agent.
+EXPOSE 4577 4578
+
+# Healthy only when both the agent and `opencode serve` answer. The bridge
+# waits for this via depends_on: service_healthy.
+HEALTHCHECK --interval=30s --timeout=8s --start-period=30s --retries=5 \
+  CMD ["node", "/opt/opencode/opencode-agent.mjs", "healthcheck"]
+
+ENTRYPOINT ["/opt/opencode/opencode-entrypoint.sh"]
