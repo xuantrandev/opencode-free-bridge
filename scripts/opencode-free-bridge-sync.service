@@ -1,0 +1,23 @@
+[Unit]
+Description=opencode-free-bridge model sync (one discovery + deploy cycle)
+Documentation=file:///home/ubuntu/opencode-free-bridge/README.md
+After=network-online.target opencode-free-bridge.service
+Wants=opencode-free-bridge.service
+
+# NOTE: the bridge already runs its own sync loop when MODEL_AUTO_SYNC=true.
+# Enable this timer ONLY when MODEL_AUTO_SYNC=false, otherwise you would have
+# two schedulers. `install.sh --with-timer` sets MODEL_AUTO_SYNC=false for you.
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/opencode-free-bridge
+EnvironmentFile=-/home/ubuntu/opencode-free-bridge/.env
+Environment=PATH=/home/ubuntu/.opencode/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash -lc 'exec "$(command -v bun || command -v node)" /home/ubuntu/opencode-free-bridge/cli.mjs models sync --quiet'
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/opencode-free-bridge

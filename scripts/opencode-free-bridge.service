@@ -1,17 +1,31 @@
 [Unit]
-Description=opencode-free-bridge (OpenAI-compatible proxy for opencode free models)
-After=network.target
+Description=opencode-free-bridge (OpenAI-compatible API for OpenCode free models)
+Documentation=file:///home/ubuntu/opencode-free-bridge/README.md
+After=network-online.target opencode-serve.service
+Wants=network-online.target opencode-serve.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-# Launcher backgrounds opencode serve + bridge itself, then exits; but we want
-# systemd to track the lifetime. `start` returns once both are listening, so we
-# use a small watchdog wrapper that keeps the unit alive by tailing the log.
-ExecStart=/bin/bash -c '/usr/local/bin/opencode-free-bridge start && tail -F /var/log/opencode-free-bridge.log'
-ExecStop=/usr/local/bin/opencode-free-bridge stop
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/opencode-free-bridge
+# MODEL_* / PORT / OPENCODE_UPSTREAM / OPENCODE_BIN settings live here (optional).
+EnvironmentFile=-/home/ubuntu/opencode-free-bridge/.env
+# Model discovery shells out to `opencode`, which lives in ~/.opencode/bin.
+Environment=PATH=/home/ubuntu/.opencode/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Use bun when available (older node builds had a libuv crash), else node.
+# install.sh rewrites this to an absolute runtime path when it can detect one.
+ExecStart=/bin/bash -lc 'exec "$(command -v bun || command -v node)" /home/ubuntu/opencode-free-bridge/server.mjs'
 Restart=on-failure
 RestartSec=5
-User=root
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/opencode-free-bridge
 
 [Install]
 WantedBy=multi-user.target

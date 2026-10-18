@@ -1,0 +1,9 @@
+{
+  "exclude": [
+    "nemotron-*"
+  ],
+  "include": [],
+  "reasons": {
+    "nemotron-*": "nemotron models are known to crash or hang opencode sessions"
+  }
+}

@@ -3,3 +3,11 @@ node_modules/
 .DS_Store
 .env
 .env.local
+
+# runtime state (registry backups, locks, verification + deployment records)
+backups/
+state/
+logs/
+run/
+config/models.json.bak
+config/*.tmp

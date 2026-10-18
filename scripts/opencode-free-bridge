@@ -1,92 +1,212 @@
 #!/usr/bin/env bash
-# opencode-free-bridge launcher
-# - starts `opencode serve` on :4577 (loopback only)
-# - starts the OpenAI-compatible bridge on :5577 (loopback only)
-# Usage:  opencode-free-bridge [start|stop|status|logs]
+# opencode-free-bridge launcher (bash wrapper around server.mjs + cli.mjs)
+#
+#   opencode-free-bridge start|stop|restart|status|logs
+#   opencode-free-bridge models ... | sync | reload | version
+#
+# Starts:
+#   - `opencode serve` on :4577 (loopback only)  -> logs/opencode-serve.log
+#   - the OpenAI-compatible bridge on :5577      -> logs/bridge.log
+#
+# The bridge itself manages model discovery and hot-reloads its registry, so
+# `restart` is only needed for code upgrades.
 
 set -u
 
-BRIDGE_DIR="/root/opencode-free-bridge"
-BRIDGE_PORT="${BRIDGE_PORT:-5577}"
-OC_PORT="${OC_PORT:-4577}"
-BRIDGE_LOG="/var/log/opencode-free-bridge.log"
-OC_LOG="/var/log/opencode-serve.log"
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(dirname "$SELF")"
 
-mkdir -p "$(dirname "$BRIDGE_LOG")" "$(dirname "$OC_LOG")"
-
-start() {
-  # 1) opencode serve (headless)
-  if ss -ltn 2>/dev/null | grep -q ":${OC_PORT} "; then
-    echo "[oc-serve] already up on :${OC_PORT}"
-  else
-    echo "[oc-serve] starting on :${OC_PORT}"
-    ( nohup opencode serve --port "${OC_PORT}" --hostname 127.0.0.1 \
-      >> "$OC_LOG" 2>&1 & echo $! > /run/opencode-serve.pid ) &
-    wait
-    sleep 2
+resolve_bridge_dir() {
+  if [ -n "${OPENCODE_FREE_BRIDGE_DIR:-}" ]; then
+    echo "$OPENCODE_FREE_BRIDGE_DIR"; return
   fi
-
-  # 2) bridge
-  if ss -ltn 2>/dev/null | grep -q ":${BRIDGE_PORT} "; then
-    echo "[bridge] already up on :${BRIDGE_PORT}"
-  else
-    echo "[bridge] starting on :${BRIDGE_PORT}"
-    # NOTE: system node 22.22.2 has a libuv SIGABRT bug on server.mjs (uv__io_poll
-    # assertion). Run the bridge under `bun` instead, which is stable here.
-    ( cd "$BRIDGE_DIR" && nohup bun server.mjs \
-      >> "$BRIDGE_LOG" 2>&1 & echo $! > /run/opencode-free-bridge.pid ) &
-    wait
-    sleep 1
+  # installed as a symlink/copy inside <repo>/scripts/ ?
+  if [ -f "${SCRIPT_DIR}/../server.mjs" ]; then
+    (cd "${SCRIPT_DIR}/.." && pwd); return
   fi
+  if [ -n "${HOME:-}" ] && [ -f "${HOME}/opencode-free-bridge/server.mjs" ]; then
+    echo "${HOME}/opencode-free-bridge"; return
+  fi
+  echo "${HOME:-/tmp}/opencode-free-bridge"
+}
 
-  # 3) health check
-  for i in 1 2 3 4 5; do
-    if curl -sf "http://127.0.0.1:${BRIDGE_PORT}/healthz" >/dev/null; then
-      echo "[ok] bridge is responding on http://127.0.0.1:${BRIDGE_PORT}/v1"
-      models=$(curl -s "http://127.0.0.1:${BRIDGE_PORT}/v1/models" | python3 -c "import json,sys; print(', '.join(m['id'] for m in json.load(sys.stdin)['data']))")
-      echo "     models: $models"
+BRIDGE_DIR="$(resolve_bridge_dir)"
+
+# Load .env for ports / runtime selection (server also reads it; this only
+# affects the launcher's own decisions).
+if [ -f "${BRIDGE_DIR}/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "${BRIDGE_DIR}/.env"
+  set +a
+fi
+
+BRIDGE_PORT="${PORT:-${BRIDGE_PORT:-5577}}"
+OC_PORT="${OPENCODE_UPSTREAM_PORT:-${OC_PORT:-4577}}"
+LOG_DIR="${BRIDGE_DIR}/logs"
+RUN_DIR="${BRIDGE_DIR}/run"
+BRIDGE_LOG="${LOG_DIR}/bridge.log"
+OC_LOG="${LOG_DIR}/opencode-serve.log"
+BRIDGE_PID="${RUN_DIR}/bridge.pid"
+OC_PID="${RUN_DIR}/opencode-serve.pid"
+
+mkdir -p "$LOG_DIR" "$RUN_DIR" 2>/dev/null || {
+  echo "[error] cannot create $LOG_DIR / $RUN_DIR" >&2
+  exit 1
+}
+
+port_listening() {
+  ss -ltn 2>/dev/null | grep -q ":$1 " && return 0
+  return 1
+}
+
+listener_pid() {
+  ss -ltnp 2>/dev/null | awk -v port=":$1 " '$4 ~ port {print $0}' | grep -oP 'pid=\K[0-9]+' | head -1
+}
+
+pick_runtime() {
+  case "${BRIDGE_RUNTIME:-auto}" in
+    bun)   command -v bun >/dev/null 2>&1 && { echo bun; return; } ;;
+    node)  command -v node >/dev/null 2>&1 && { echo node; return; } ;;
+    auto|*)
+      if command -v bun >/dev/null 2>&1; then echo bun; return; fi
+      if command -v node >/dev/null 2>&1; then echo node; return; fi
+      ;;
+  esac
+  echo "" # nothing usable
+}
+
+spawn_detached() {
+  # spawn_detached <logfile> <pidfile> <command...>
+  local log="$1"; shift
+  local pidfile="$1"; shift
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "$@" >> "$log" 2>&1 < /dev/null &
+  else
+    nohup "$@" >> "$log" 2>&1 < /dev/null &
+  fi
+  local pid=$!
+  echo "$pid" > "$pidfile"
+  disown 2>/dev/null || true
+}
+
+start_upstream() {
+  if port_listening "$OC_PORT"; then
+    echo "[oc-serve] already listening on :${OC_PORT}"
+    return 0
+  fi
+  if ! command -v opencode >/dev/null 2>&1; then
+    echo "[oc-serve] ERROR: 'opencode' CLI not found on PATH" >&2
+    return 1
+  fi
+  echo "[oc-serve] starting on :${OC_PORT} (log: ${OC_LOG})"
+  spawn_detached "$OC_LOG" "$OC_PID" opencode serve --port "$OC_PORT" --hostname 127.0.0.1
+}
+
+start_bridge() {
+  if port_listening "$BRIDGE_PORT"; then
+    echo "[bridge] already listening on :${BRIDGE_PORT}"
+    return 0
+  fi
+  local runtime
+  runtime="$(pick_runtime)"
+  if [ -z "$runtime" ]; then
+    echo "[bridge] ERROR: neither bun nor node found on PATH" >&2
+    return 1
+  fi
+  echo "[bridge] starting on :${BRIDGE_PORT} with ${runtime} (log: ${BRIDGE_LOG})"
+  ( cd "$BRIDGE_DIR" && spawn_detached "$BRIDGE_LOG" "$BRIDGE_PID" "$runtime" server.mjs )
+}
+
+wait_healthy() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -sf --max-time 2 "http://127.0.0.1:${BRIDGE_PORT}/healthz" >/dev/null; then
       return 0
     fi
     sleep 1
   done
-  echo "[fail] bridge did not become healthy"
   return 1
 }
 
-stop() {
-  for f in /run/opencode-free-bridge.pid /run/opencode-serve.pid; do
-    [ -f "$f" ] || continue
-    pid=$(cat "$f")
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null
-      echo "killed pid $pid ($(basename "$f"))"
-    fi
-    rm -f "$f"
-  done
-  # also kill any straggler by port
-  for p in "${OC_PORT}" "${BRIDGE_PORT}"; do
-    pid=$(ss -ltnp 2>/dev/null | awk -v port=":${p} " '$4 ~ port {print $0}' | grep -oP 'pid=\K[0-9]+' | head -1)
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null
-  done
+systemd_owns_bridge() {
+  command -v systemctl >/dev/null 2>&1 \
+    && systemctl is-active --quiet opencode-free-bridge.service 2>/dev/null
 }
 
-status() {
-  for p in "${OC_PORT}" "${BRIDGE_PORT}"; do
-    if ss -ltn 2>/dev/null | grep -q ":${p} "; then
-      echo "  :${p}  LISTEN"
-    else
-      echo "  :${p}  DOWN"
+cmd_start() {
+  if systemd_owns_bridge; then
+    echo "[info] opencode-free-bridge.service is running under systemd; nothing to do"
+    echo "       manage it with: sudo systemctl start|stop|restart opencode-free-bridge.service"
+    return 0
+  fi
+  start_upstream || return 1
+  start_bridge || return 1
+  if wait_healthy; then
+    echo "[ok] bridge is responding on http://127.0.0.1:${BRIDGE_PORT}"
+    curl -s --max-time 3 "http://127.0.0.1:${BRIDGE_PORT}/v1/models" \
+      | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print('     models:', ', '.join(m['id'] for m in d) or '(none yet)')" 2>/dev/null \
+      || true
+    return 0
+  fi
+  echo "[fail] bridge did not become healthy — check ${BRIDGE_LOG}" >&2
+  return 1
+}
+
+kill_pidfile() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  local pid
+  pid="$(cat "$f" 2>/dev/null || true)"
+  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null && echo "stopped pid $pid ($(basename "$f"))"
+  fi
+  rm -f "$f"
+}
+
+cmd_stop() {
+  if systemd_owns_bridge; then
+    echo "[info] opencode-free-bridge.service is managed by systemd; use:" >&2
+    echo "       sudo systemctl stop opencode-free-bridge.service" >&2
+    return 1
+  fi
+  kill_pidfile "$BRIDGE_PID"
+  kill_pidfile "$OC_PID"
+  local p pid
+  for p in "$BRIDGE_PORT" "$OC_PORT"; do
+    pid="$(listener_pid "$p")"
+    if [ -n "${pid:-}" ] && [ "$pid" != "$$" ]; then
+      kill "$pid" 2>/dev/null && echo "stopped pid $pid (port :$p)"
     fi
   done
-  curl -s "http://127.0.0.1:${BRIDGE_PORT}/healthz" 2>/dev/null || true
-  echo
+  return 0
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  cmd_start
+}
+
+dispatch_cli() {
+  local runtime
+  runtime="$(pick_runtime)"
+  if [ -z "$runtime" ]; then
+    echo "[error] neither bun nor node found on PATH" >&2
+    exit 1
+  fi
+  exec "$runtime" "${BRIDGE_DIR}/cli.mjs" "$@"
 }
 
 case "${1:-start}" in
-  start)   start ;;
-  stop)    stop ;;
-  restart) stop; sleep 1; start ;;
-  status)  status ;;
-  logs)    tail -n 50 -F "$BRIDGE_LOG" "$OC_LOG" ;;
-  *)       echo "usage: $0 [start|stop|restart|status|logs]"; exit 1 ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status|logs|models|sync|reload|version|help)
+    dispatch_cli "$@" ;;
+  -v|--version)
+    dispatch_cli version ;;
+  *)
+    echo "usage: opencode-free-bridge [start|stop|restart|status|logs|models|sync|reload|version]" >&2
+    exit 1 ;;
 esac

@@ -1,0 +1,28 @@
+[Unit]
+Description=OpenCode headless server (upstream for opencode-free-bridge)
+Documentation=file:///home/ubuntu/opencode-free-bridge/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/opencode-free-bridge
+# opencode is normally installed in ~/.opencode/bin, which is not on the
+# default systemd PATH. install.sh rewrites ExecStart to an absolute path
+# when it can detect one.
+Environment=PATH=/home/ubuntu/.opencode/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash -lc 'exec opencode serve --port 4577 --hostname 127.0.0.1'
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

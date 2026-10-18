@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "beam-free",
+      "context": 1048576,
+      "output": 131072,
+      "status": "discovered",
+      "addedAt": "2026-10-18T05:16:39.217Z",
+      "verifiedAt": null,
+      "failCount": 0,
+      "freeReason": "zero-cost",
+      "name": "Beam Free"
+    },
+    {
+      "id": "big-pickle",
+      "context": 200000,
+      "output": 32000,
+      "status": "discovered",
+      "addedAt": "2026-10-18T04:50:00.000Z",
+      "verifiedAt": null,
+      "failCount": 0,
+      "freeReason": "zero-cost",
+      "name": "Big Pickle"
+    },
+    {
+      "id": "deepseek-v4.1-flash-free",
+      "context": 200000,
+      "output": 32000,
+      "status": "discovered",
+      "addedAt": "2026-10-18T04:50:00.000Z",
+      "verifiedAt": null,
+      "failCount": 0,
+      "freeReason": "zero-cost",
+      "name": "DeepSeek V4.1 Flash Free"
+    },
+    {
+      "id": "glm-5.3-flash-free",
+      "context": 200000,
+      "output": 32000,
+      "status": "discovered",
+      "addedAt": "2026-10-18T04:50:00.000Z",
+      "verifiedAt": null,
+      "failCount": 0,
+      "freeReason": "zero-cost",
+      "name": "GLM-5.3-Flash Free"
+    },
+    {
+      "id": "longcat-2.5-preview-free",
+      "context": 1000000,
+      "output": 131072,
+      "status": "discovered",
+      "addedAt": "2026-10-18T04:50:00.000Z",
+      "verifiedAt": null,
+      "failCount": 0,
+      "freeReason": "zero-cost",
+      "name": "LongCat 2.5 Preview Free"
+    },
+    {
+      "id": "mimo-v2.6-flash-free",
+      "context": 200000,
+      "output": 32000,
+      "status": "discovered",
+      "addedAt": "2026-10-18T04:50:00.000Z",
+      "verifiedAt": null,
+      "failCount": 0,
+      "freeReason": "zero-cost",
+      "name": "MiMo-V2.6-Flash Free"
+    },
+    {
+      "id": "space-bunny-free",
+      "context": 1048576,
+      "output": 524288,
+      "status": "discovered",
+      "addedAt": "2026-10-18T05:14:08.388Z",
+      "verifiedAt": null,
+      "failCount": 0,
+      "freeReason": "zero-cost",
+      "name": "Space Bunny Free"
+    }
+  ],
+  "lastUpdated": "2026-10-18T05:16:39.218Z",
+  "lastSync": "2026-10-18T05:37:55.375Z",
+  "lastSyncStatus": "unchanged",
+  "lastDeploy": null,
+  "source": "opencode models opencode",
+  "generation": 7
+}

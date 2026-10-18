@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic model sync for opencode-free-bridge
+Documentation=file:///home/ubuntu/opencode-free-bridge/README.md
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=60min
+RandomizedDelaySec=120
+Persistent=true
+Unit=opencode-free-bridge-sync.service
+
+[Install]
+WantedBy=timers.target
