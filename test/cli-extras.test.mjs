@@ -127,15 +127,18 @@ test('cli: config verify --online reports upstream reachability', async (t) => {
 test('cli: restart signals the pid from the run directory', async (t) => {
   const env = await makeTempEnv();
   t.after(() => env.cleanup());
-  const child = spawn(NODE, ['-e', "process.on('SIGTERM',()=>{console.log('term');process.exit(0)});setInterval(()=>{},1000)"], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(NODE, ['-e', "process.on('SIGTERM',()=>{console.log('term');process.exit(0)});setInterval(()=>{},1000);console.log('ready')"], { stdio: ['ignore', 'pipe', 'pipe'] });
   t.after(() => { try { child.kill('SIGKILL'); } catch {} });
-  await waitFor(() => child.pid > 0, { what: 'child pid' });
+  const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  await waitFor(() => output.includes('ready'), { what: 'child signal handler ready' });
   fs.writeFileSync(path.join(env.dir, 'run', 'bridge.pid'), `${child.pid}\n`);
 
   const res = await runCli(['restart'], { OPENCODE_FREE_BRIDGE_DIR: env.dir });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, new RegExp(`SIGTERM to bridge pid ${child.pid}`));
-  const exit = await new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const exit = await exited;
   assert.equal(exit.code, 0);
 });
 

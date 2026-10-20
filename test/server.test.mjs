@@ -196,6 +196,71 @@ test('upstream 429 preserves the status and maps to rate_limit_error', async (t)
   assert.equal(res.json.error.code, 'rate_limit_exceeded');
 });
 
+test('assistant errors inside HTTP 200 fail JSON and streaming completions', async (t) => {
+  const { base, up } = await startBridge(t, {
+    upstreamOptions: {
+      message: () => ({
+        status: 200,
+        body: {
+          info: { error: { name: 'APIError', data: { statusCode: 403, message: 'Network blocked: bearer secret123456' } } },
+          parts: [],
+        },
+      }),
+    },
+  });
+  const body = { model: 'a-free', messages: [{ role: 'user', content: 'x' }] };
+  const json = await httpJson(`${base}/v1/chat/completions`, { method: 'POST', body });
+  assert.equal(json.status, 403);
+  assert.equal(json.json.error.code, 'upstream_forbidden');
+  assert.equal(json.text.includes('secret123456'), false);
+  assert.equal(json.json.choices, undefined);
+
+  const stream = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...body, stream: true }),
+  });
+  const events = await readSse(stream);
+  assert.equal(events.at(-1), '[DONE]');
+  assert.equal(events.at(-2).error.code, 'upstream_forbidden');
+  assert.equal(events.some(e => e.choices?.[0]?.finish_reason === 'stop'), false);
+  assert.equal(up.state.messageCounts['a-free'], 2, 'forbidden errors must not be retried');
+  await waitFor(() => up.state.sessions.size === 0, { what: 'failed session cleanup' });
+});
+
+test('embedded retryable assistant errors recover with a fresh session', async (t) => {
+  const { base, up } = await startBridge(t, {
+    env: { UPSTREAM_RETRIES: '1' },
+    upstreamOptions: {
+      messageQueue: {
+        'a-free': [
+          { status: 200, body: { info: { error: { name: 'APIError', data: { statusCode: 503, message: 'try later' } } }, parts: [] } },
+          { status: 200 },
+        ],
+      },
+    },
+  });
+  const res = await httpJson(`${base}/v1/chat/completions`, {
+    method: 'POST', body: { model: 'a-free', messages: [{ role: 'user', content: 'x' }] },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.choices[0].message.content, 'echo:a-free');
+  assert.equal(up.state.sessionSeq, 2);
+});
+
+test('assistant errors without a valid HTTP error status map to 502', async (t) => {
+  const { base } = await startBridge(t, {
+    env: { UPSTREAM_RETRIES: '0' },
+    upstreamOptions: {
+      message: () => ({ status: 200, body: { info: { error: { name: 'UnknownError', data: { statusCode: 200 } } }, parts: [] } }),
+    },
+  });
+  const res = await httpJson(`${base}/v1/chat/completions`, {
+    method: 'POST', body: { model: 'a-free', messages: [{ role: 'user', content: 'x' }] },
+  });
+  assert.equal(res.status, 502);
+  assert.equal(res.json.error.code, 'upstream_error');
+});
+
 test('upstream 500 includes the upstream ref id and preserves the status', async (t) => {
   const { base } = await startBridge(t, {
     env: { UPSTREAM_RETRIES: '0' },

@@ -555,7 +555,14 @@ discovery-agent tests spawn the real agent with a mocked CLI binary.
   credentials. Run `./scripts/migrate-auth.sh` or
   `docker compose exec opencode-server opencode auth login`, then
   `docker compose exec opencode-bridge bridge-cli models sync`.
-- **Docker: 403 on every request** — `ALLOW_NON_LOOPBACK` is not set for the
+- **Completions return `upstream_forbidden` (403)** — the provider denied
+  inference. OpenCode can report a network-level free-tier restriction even
+  when discovery and readiness succeed. Inspect
+  `docker compose logs opencode-bridge opencode-server` for the provider's
+  reason; rebuilding the containers cannot remove a provider restriction.
+  Embedded assistant errors are returned as API errors
+  (or SSE error events), rather than empty successful completions.
+- **Docker: `forbidden` (403) on every request** — `ALLOW_NON_LOOPBACK` is not set for the
   bridge (Compose sets it); for manual runs add it, or set
   `BRIDGE_API_KEY` and expose through `BRIDGE_BIND`.
 - **Docker: discovery fails with 401** — `DISCOVERY_TOKEN` differs between
