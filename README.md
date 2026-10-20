@@ -76,10 +76,18 @@ Parents that prefer scheduled syncs can set `MODEL_AUTO_SYNC=false` and enable
 ```bash
 git clone https://github.com/raksix/opencode-free-bridge.git
 cd opencode-free-bridge
-cp .env.example .env          # optionally set BRIDGE_API_KEY / DISCOVERY_TOKEN
-docker compose up -d --build
+cp .env.example .env
+# Edit .env: replace DISCOVERY_TOKEN=change-me; optionally set BRIDGE_API_KEY.
+./deploy.sh
 curl -s http://127.0.0.1:5577/health | jq
 ```
+
+Requires Docker and the Docker Compose plugin. `deploy.sh` requires an existing
+`.env`, preserves its contents, and builds and starts the stack in the background.
+Run it again after updating the checkout to rebuild and deploy the latest code.
+The script reports startup status; use `/health` to check bridge liveness.
+Run `./deploy.sh --stop` to stop and remove the stack containers while preserving
+named volumes. Stopping also works if `.env` is missing.
 
 Two containers come up: `opencode-server` (runs `opencode serve` plus an
 internal authenticated discovery agent) and `opencode-bridge` (the HTTP API,
