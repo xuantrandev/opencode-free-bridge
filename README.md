@@ -26,9 +26,23 @@ and rolled back automatically if a deployment breaks anything.
 
 ## What it does
 
-- `GET /v1/models` — every currently available free model (live registry)
-- `GET /v1/models/{id}` — one model, 404 for unknown ids
+- `GET /v1/models` — the synthetic `auto` entry plus every currently available free model (live registry)
+- `GET /v1/models/{id}` — one model, 404 for unknown ids (`auto` is always resolvable)
 - `POST /v1/chat/completions` — non-streaming and `stream: true` (SSE)
+
+### Automatic model selection (`auto`)
+
+Chat completions accept `"model": "auto"` (case-insensitive, also served at
+`/v1/models[/id]`). It resolves per request against the live registry, preferring:
+
+1. any model whose id contains `deepseek`
+2. next, any model whose id contains `glm`
+3. otherwise, any remaining model
+
+Within each group, models that have passed verification
+(`status: "verified"`) are preferred over merely discovered ones. If nothing
+matches (empty registry), the request fails with a `404 model_not_found`.
+Responses always echo the concrete model id that was actually used.
 - `GET /health` — rich status (upstream, sync state, registry hash)
 - `GET /health/ready` — readiness probe (503 until registry + upstream ready)
 - `GET /healthz` — plain 200 liveness probe (compat)
@@ -360,7 +374,7 @@ variables override `.env`. **No API key is required.**
 curl -s http://127.0.0.1:5577/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "big-pickle",
+    "model": "auto",
     "messages": [{"role":"user","content":"2+2=? Number only."}],
     "max_tokens": 20
   }'

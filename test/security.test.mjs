@@ -39,7 +39,7 @@ test('BRIDGE_API_KEY protects /v1/* with an OpenAI-shaped 401', async (t) => {
 
   const ok = await httpJson(`${base}/v1/models`, { headers: { Authorization: 'Bearer secret-key' } });
   assert.equal(ok.status, 200);
-  assert.equal(ok.json.data.length, 2);
+  assert.equal(ok.json.data.length, 3);
 
   // Health probes stay open (Docker healthcheck) but never leak secrets.
   const health = await httpJson(`${base}/health`);

@@ -22,6 +22,8 @@ import { VERSION } from './lib/version.mjs';
 
 const SYSTEM_DEFAULT = 'You are a helpful assistant.';
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+const AUTO_ID = 'auto';
+const AUTO_PRIORITY = ['deepseek', 'glm'];
 
 /** Constant-time string comparison (hashed first so lengths never leak). */
 export function constantTimeEqual(a, b) {
@@ -34,6 +36,41 @@ export function extractBearerToken(header) {
   if (typeof header !== 'string') return null;
   const match = /^bearer[ \t]+(.+)$/i.exec(header.trim());
   return match ? match[1].trim() : null;
+}
+
+export function resolveAutoModel(registry) {
+  let best = null;
+  let bestScore = Infinity;
+  for (const m of registry.models) {
+    if (!m || typeof m.id !== 'string' || !m.id) continue;
+    let family = AUTO_PRIORITY.findIndex((needle) => m.id.toLowerCase().includes(needle));
+    if (family < 0) family = AUTO_PRIORITY.length;
+    const score = family * 2 + (m.status === 'verified' ? 0 : 1);
+    if (score < bestScore || (score === bestScore && m.id.localeCompare(best.id) < 0)) {
+      best = m;
+      bestScore = score;
+    }
+  }
+  return best ? best.id : null;
+}
+
+function isAutoModelId(value) {
+  return typeof value === 'string' && value.trim().toLowerCase() === AUTO_ID;
+}
+
+function autoModelEntry() {
+  return {
+    id: AUTO_ID,
+    object: 'model',
+    created: 1700000000,
+    owned_by: 'opencode-free',
+    context_window: null,
+    max_output_tokens: null,
+    free: true,
+    priority: AUTO_PRIORITY,
+    status: 'auto',
+    verified: false,
+  };
 }
 
 function jsonResponse(res, status, body, extraHeaders = {}) {
@@ -289,10 +326,11 @@ export function createBridgeServer({
       status: m.status ?? 'discovered',
       verified: m.status === 'verified',
     }));
-    jsonResponse(res, 200, { object: 'list', data }, cors);
+    jsonResponse(res, 200, { object: 'list', data: [autoModelEntry(), ...data] }, cors);
   }
 
   function handleGetModel(req, res, id, cors = {}) {
+    if (isAutoModelId(id)) return jsonResponse(res, 200, autoModelEntry(), cors);
     registry.reloadFromDisk();
     const m = registry.get(id);
     if (!m) return jsonResponse(res, 404, openaiErrorBody(`model '${id}' not found`, 'invalid_request_error', 'model_not_found', 'model'), cors);
@@ -451,6 +489,18 @@ export function createBridgeServer({
     }
 
     registry.reloadFromDisk();
+    if (isAutoModelId(body.model)) {
+      const resolved = resolveAutoModel(registry);
+      if (!resolved) {
+        return jsonResponse(res, 404, openaiErrorBody(
+          "model 'auto' resolved to nothing: the registry has no available models",
+          'invalid_request_error',
+          'model_not_found',
+          'model',
+        ), cors);
+      }
+      body.model = resolved;
+    }
     if (!body.model || typeof body.model !== 'string') {
       return jsonResponse(res, 400, openaiErrorBody("you must provide a 'model' parameter", 'invalid_request_error', 'missing_model', 'model'), cors);
     }

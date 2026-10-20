@@ -6,7 +6,7 @@ import { ModelRegistry } from '../lib/registry.mjs';
 import { OpenCodeClient } from '../lib/opencode-client.mjs';
 import { createLogger } from '../lib/logger.mjs';
 import {
-  makeTempEnv, httpJson, readSse, startMockUpstream, waitFor, writeRegistry,
+  makeTempEnv, httpJson, readSse, startMockUpstream, waitFor, writeRegistry, makeModelEntry,
 } from './helpers.mjs';
 
 const silent = createLogger({ silent: true });
@@ -69,14 +69,27 @@ test('GET /v1/models serves the registry', async (t) => {
   const res = await httpJson(`${base}/v1/models`);
   assert.equal(res.status, 200);
   assert.equal(res.json.object, 'list');
-  assert.deepEqual(res.json.data.map((m) => m.id), ['a-free', 'b-free']);
-  assert.equal(res.json.data[0].object, 'model');
-  assert.equal(res.json.data[0].free, true);
+  assert.deepEqual(res.json.data.map((m) => m.id), ['auto', 'a-free', 'b-free']);
+  const auto = res.json.data[0];
+  assert.equal(auto.id, 'auto');
+  assert.equal(auto.free, true);
+  assert.equal(auto.status, 'auto');
+  assert.deepEqual(auto.priority, ['deepseek', 'glm']);
+  const ids = res.json.data.slice(1).map((m) => m.id);
+  assert.deepEqual(ids, ['a-free', 'b-free']);
+  assert.equal(res.json.data[1].object, 'model');
+  assert.equal(res.json.data[1].free, true);
   assert.equal(registry.models.length, 2);
 
   const one = await httpJson(`${base}/v1/models/a-free`);
   assert.equal(one.status, 200);
   assert.equal(one.json.id, 'a-free');
+  const autoOne = await httpJson(`${base}/v1/models/auto`);
+  assert.equal(autoOne.status, 200);
+  assert.equal(autoOne.json.id, 'auto');
+  const autoUpper = await httpJson(`${base}/v1/models/AUTO`);
+  assert.equal(autoUpper.status, 200);
+  assert.equal(autoUpper.json.id, 'auto');
   const missing = await httpJson(`${base}/v1/models/nope-free`);
   assert.equal(missing.status, 404);
   assert.equal(missing.json.error.code, 'model_not_found');
@@ -111,6 +124,88 @@ test('unknown model is rejected locally with an OpenAI 404 error', async (t) => 
   assert.equal(res.json.error.code, 'model_not_found');
   assert.match(res.json.error.message, /a-free, b-free/);
   assert.equal(up.state.calls.some((c) => c.url.endsWith('/message')), false, 'no upstream inference for unknown models');
+});
+
+test('AUTO resolves to deepseek over glm and other models', async (t) => {
+  const { base, up } = await startBridge(t, {
+    models: ['other-free', 'glm-5.3-flash-free', 'deepseek-v4.1-flash-free'],
+  });
+  const res = await httpJson(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    body: { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.model, 'deepseek-v4.1-flash-free');
+  assert.equal(up.state.messageCounts['deepseek-v4.1-flash-free'], 1);
+  assert.equal(up.state.messageCounts['glm-5.3-flash-free'] ?? 0, 0);
+  const upper = await httpJson(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    body: { model: 'AUTO', messages: [{ role: 'user', content: 'hi' }] },
+  });
+  assert.equal(upper.status, 200);
+  assert.equal(upper.json.model, 'deepseek-v4.1-flash-free');
+});
+
+test('AUTO falls back to glm when deepseek is absent, and to any model otherwise', async (t) => {
+  const { base, up } = await startBridge(t, {
+    models: ['other-free', 'glm-5.3-flash-free'],
+  });
+  const res = await httpJson(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    body: { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.model, 'glm-5.3-flash-free');
+  assert.equal(up.state.messageCounts['glm-5.3-flash-free'], 1);
+
+  const { base: base2, up: up2 } = await startBridge(t, { models: ['zeta-free', 'alpha-free'] });
+  const res2 = await httpJson(`${base2}/v1/chat/completions`, {
+    method: 'POST',
+    body: { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
+  });
+  assert.equal(res2.status, 200);
+  assert.equal(res2.json.model, 'alpha-free');
+  assert.equal(up2.state.messageCounts['alpha-free'], 1);
+});
+
+test('AUTO: family priority wins over verified status, verified wins within a family', async (t) => {
+  const { base } = await startBridge(t, {
+    models: [
+      makeModelEntry('deepseek-v4.1-flash-free'),
+      makeModelEntry('glm-5.3-flash-free', { status: 'verified', verifiedAt: '2026-01-01T00:00:00.000Z' }),
+    ],
+  });
+  const res = await httpJson(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    body: { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.model, 'deepseek-v4.1-flash-free');
+
+  const { base: base2 } = await startBridge(t, {
+    models: [
+      makeModelEntry('deepseek-a-free'),
+      makeModelEntry('deepseek-b-free', { status: 'verified', verifiedAt: '2026-01-01T00:00:00.000Z' }),
+    ],
+  });
+  const res2 = await httpJson(`${base2}/v1/chat/completions`, {
+    method: 'POST',
+    body: { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
+  });
+  assert.equal(res2.status, 200);
+  assert.equal(res2.json.model, 'deepseek-b-free');
+});
+
+test('AUTO with an empty registry returns 404 model_not_found', async (t) => {
+  const { base, up } = await startBridge(t, { models: [] });
+  const res = await httpJson(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    body: { model: 'AUTO', messages: [{ role: 'user', content: 'hi' }] },
+  });
+  assert.equal(res.status, 404);
+  assert.equal(res.json.error.code, 'model_not_found');
+  assert.match(res.json.error.message, /'auto'/);
+  assert.equal(up.state.calls.some((c) => c.url.endsWith('/message')), false);
 });
 
 test('invalid JSON and missing model produce 400s', async (t) => {
@@ -346,15 +441,15 @@ test('per-request sessions are cleaned up after the response', async (t) => {
 test('hot reload: registry file changes are served without a restart', async (t) => {
   const { base, temp, up } = await startBridge(t, { models: ['a-free'] });
   const before = await httpJson(`${base}/v1/models`);
-  assert.deepEqual(before.json.data.map((m) => m.id), ['a-free']);
+  assert.deepEqual(before.json.data.slice(1).map((m) => m.id), ['a-free']);
 
   await new Promise((r) => setTimeout(r, 20));
   writeRegistry(temp.dir, ['a-free', 'hot-added-free']);
   const after = await waitFor(async () => {
     const res = await httpJson(`${base}/v1/models`);
-    return res.json.data.length === 2 ? res : null;
+    return res.json.data.length === 3 ? res : null;
   }, { timeoutMs: 5000, what: 'hot reload' });
-  assert.deepEqual(after.json.data.map((m) => m.id), ['a-free', 'hot-added-free']);
+  assert.deepEqual(after.json.data.slice(1).map((m) => m.id), ['a-free', 'hot-added-free']);
 
   const chat = await httpJson(`${base}/v1/chat/completions`, {
     method: 'POST',
@@ -400,7 +495,7 @@ test('GET /healthz stays backwards compatible', async (t) => {
 test('bridge recovers models after restart', async (t) => {
   const first = await startBridge(t, { models: ['persist-free'] });
   const before = await httpJson(`${first.base}/v1/models`);
-  assert.deepEqual(before.json.data.map((m) => m.id), ['persist-free']);
+  assert.deepEqual(before.json.data.slice(1).map((m) => m.id), ['persist-free']);
   await first.bridge.close();
 
   const second = await startBridge(t, { models: ['ignored-free'] });
@@ -411,7 +506,7 @@ test('bridge recovers models after restart', async (t) => {
   await bridge.listen(0, '127.0.0.1');
   t.after(() => bridge.close());
   const after = await httpJson(`http://127.0.0.1:${bridge.port}/v1/models`);
-  assert.deepEqual(after.json.data.map((m) => m.id), ['persist-free']);
+  assert.deepEqual(after.json.data.slice(1).map((m) => m.id), ['persist-free']);
 });
 
 test('non-loopback clients are rejected', async (t) => {
