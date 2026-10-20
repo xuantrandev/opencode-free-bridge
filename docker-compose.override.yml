@@ -1,0 +1,34 @@
+# Optional Traefik exposure for this checkout. Loaded automatically by
+# `docker compose` (merged on top of docker-compose.yml). Attaches ONLY the
+# bridge to the external Traefik network; the OpenCode upstream and the
+# discovery agent stay on the Docker-internal network.
+#
+# Requires BRIDGE_API_KEY in .env (the bridge becomes publicly reachable) and
+# TRAEFIK_HOST (the public hostname). Traefik uses ACME DNS-01 via Cloudflare,
+# so the hostname needs an A/AAA record pointing at this host.
+
+services:
+  opencode-bridge:
+    networks:
+      - default
+      - traefik
+    labels:
+      - 'traefik.enable=true'
+      - 'traefik.docker.network=traefik_proxy_network'
+      # HTTPS entrypoint, ACME DNS-01 certificate (letsencrypt resolver).
+      - 'traefik.http.routers.opencode-bridge-secure.rule=Host(`${TRAEFIK_HOST:?set TRAEFIK_HOST in .env}`)'
+      - 'traefik.http.routers.opencode-bridge-secure.entrypoints=websecure'
+      - 'traefik.http.routers.opencode-bridge-secure.tls.certresolver=letsencrypt'
+      # Plain HTTP redirects to HTTPS.
+      - 'traefik.http.routers.opencode-bridge.rule=Host(`${TRAEFIK_HOST:-localhost}`)'
+      - 'traefik.http.routers.opencode-bridge.entrypoints=web'
+      - 'traefik.http.routers.opencode-bridge.middlewares=opencode-bridge-redirect'
+      - 'traefik.http.middlewares.opencode-bridge-redirect.redirectscheme.scheme=https'
+      - 'traefik.http.middlewares.opencode-bridge-redirect.redirectscheme.permanent=false'
+      # Serving the bridge directly (this is the correct service).
+      - 'traefik.http.services.opencode-bridge.loadbalancer.server.port=5577'
+
+networks:
+  traefik:
+    external: true
+    name: traefik_proxy_network
