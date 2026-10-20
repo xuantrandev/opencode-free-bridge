@@ -65,8 +65,10 @@ services:
     logging: *default-logging
     security_opt:
       - no-new-privileges:true
-    mem_limit: 2g
-    cpus: 2.0
+    # Resource limits are env-configurable so small hosts (1 CPU) can deploy.
+    # Note: cpus must be <= the host CPU count; mem_limit units are like 1g/512m.
+    mem_limit: ${OPENCODE_SERVER_MEM_LIMIT:-2g}
+    cpus: ${OPENCODE_SERVER_CPUS:-1.0}
     pids_limit: 512
 
   opencode-bridge:
@@ -124,8 +126,8 @@ services:
     logging: *default-logging
     security_opt:
       - no-new-privileges:true
-    mem_limit: 1g
-    cpus: 1.5
+    mem_limit: ${BRIDGE_MEM_LIMIT:-1g}
+    cpus: ${BRIDGE_CPUS:-1.0}
     pids_limit: 256
 
 volumes:
